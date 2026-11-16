@@ -1,564 +1,671 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Create Blender data from the Blender-independent dotXSI scene model."""
+"""Create Blender data from the Blender-independent scene description (`model.Scene`).
+
+Both importers (dotXSI and native .scn/.emdl) produce a `model.Scene`; this module turns it into
+objects, meshes, cameras, lights, materials, armatures and actions.
+
+Coordinates: points convert as A p and transforms as A M A^-1 (see `convert.AxisConversion`). Cameras
+and lights look down -Z in both applications, so their own frame gets an extra P on the right, and
+their children a P^-1 on the left.
+
+Skeletons: nodes chosen by `skeleton.plan` become bones of one armature per skeleton. A bone's rest
+matrix is the node's rest frame (in armature space) rotated so that the bone's Y axis follows the node's
+X axis (Softimage chains point down X): B = normalize(N @ R). Pose: for a bone whose parent bone is p,
+basis = B^-1 @ B_p @ R^-1 @ L(t) @ R (root bones: B^-1 @ L(t) @ R), where L(t) is the node's converted
+local matrix. Objects parented to a bone use matrix_parent_inverse = T(0, -length, 0) @ R^-1 so their
+basis stays the node-local matrix.
+"""
 
 from __future__ import annotations
 
-from math import radians
-import os
+from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Callable
 
 import bpy
-from mathutils import Euler, Matrix, Vector
+import numpy as np
+from mathutils import Matrix
 
-from .model import AnimationCurve, Material, Scene, SceneObject, Transform
-
+from . import blender_anim, blender_mesh, convert, skeleton
+from .blender_materials import MaterialBuilder
+from .convert import AxisConversion
+from .images import ImageResolver
+from .model import AnimationCurve, Scene, SceneObject, Transform
 
 Report = Callable[[set[str], str], None]
-C = Matrix.Rotation(radians(90.0), 4, "X")
-C_INV = C.inverted()
 LIGHT_POWER = {"POINT": 1000.0, "SPOT": 2000.0, "SUN": 3.0, "AREA": 1000.0}
+R_BONE = np.array([[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0],
+                   [0.0, 0.0, 0.0, 1.0]])   # Rz(-90): bone Y follows node X
+R_BONE_INV = R_BONE.T
+FIXED_KINDS = {"CAMERA", "LIGHT"}
 
 
-def convert_point(point: tuple[float, float, float]) -> tuple[float, float, float]:
+@dataclass
+class ImportOptions:
+    import_materials: bool = True
+    import_textures: bool = True
+    search_textures: bool = True
+    import_animation: bool = True
+    import_shape_animation: bool = True
+    use_collection: bool = True
+    skeleton_mode: str = "AUTO"          # AUTO, ALL, NONE
+    up_axis: str = "Y"
+    global_scale: float = 1.0
+    set_scene_frames: bool = True
+
+
+def to_matrix(array: np.ndarray) -> Matrix:
+    return Matrix(np.asarray(array, dtype=np.float64).tolist())
+
+
+def local_matrix(transform: Transform) -> np.ndarray:
+    return convert.transform_matrix(
+        transform.position, transform.rotation, transform.scale, transform.rotation_order,
+        transform.quaternion,
+    )
+
+
+# Kept for backwards compatibility with earlier versions of this module.
+def convert_point(point):
     x, y, z = point
     return (x, -z, y)
 
 
-def local_matrix(transform: Transform) -> Matrix:
-    rotation = Euler(
-        tuple(radians(value) for value in transform.rotation),
-        transform.rotation_order,
-    )
-    return Matrix.LocRotScale(
-        Vector(transform.position),
-        rotation.to_quaternion(),
-        Vector(transform.scale),
-    )
+class SceneBuilder:
+    def __init__(self, context, scene: Scene, options: ImportOptions, report: Report,
+                 material_lookup: Callable[[str], bpy.types.Material] | None = None):
+        self.context = context
+        self.scene = scene
+        self.options = options
+        self.report = report
+        self.conv = AxisConversion.from_up_axis(options.up_axis, options.global_scale)
+        self.P = self.conv.rotation4
+        self.P_inv = self.P.T
+        self.objects: list[bpy.types.Object] = []
+        self.made: dict[int, bpy.types.Object] = {}          # id(node) -> object carrying its data
+        self.world: dict[int, np.ndarray] = {}               # id(node) -> Blender world (rest) matrix
+        self.material_lookup = material_lookup
+        self.materials: MaterialBuilder | None = None
+        self.plan: skeleton.Plan | None = None
+        self.armatures: dict[int, bpy.types.Object] = {}     # id(group) -> armature object
+        self.armature_groups: dict[int, skeleton.Group] = {}  # armature object pointer -> group
+        self.bone_names: dict[int, str] = {}                 # id(node) -> Blender bone name
+        self.bone_children: list[tuple[bpy.types.Object, SceneObject, np.ndarray]] = []
+        self.shape_key_names: dict[int, list[str | None]] = {}
 
+    # .................................................................. entry
+    def build(self) -> list[bpy.types.Object]:
+        context = self.context
+        if context.object is not None and context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        self.collection = context.collection
+        if self.options.use_collection:
+            name = Path(self.scene.source_path).stem or self.scene.name
+            self.collection = bpy.data.collections.new(name)
+            context.collection.children.link(self.collection)
+        for obj in context.selected_objects:
+            obj.select_set(False)
+        if self.options.import_materials and self.material_lookup is None:
+            resolver = ImageResolver(self.scene.source_path, self.options.search_textures)
+            self.materials = MaterialBuilder(self.scene, resolver, self.options.import_textures, self.report)
+        self.scene.link_parents()
+        self.plan = skeleton.plan(self.scene, self.options.skeleton_mode, self.conv)
+        for root in self.scene.objects:
+            self._create(root, None, np.eye(4))
+        for group in self.plan.groups:
+            self._build_armature(group)
+        self._parent_to_bones()
+        self._deformers()
+        if self.options.import_animation:
+            self._animate()
+        for obj in self.objects:
+            if not obj.hide_get():
+                obj.select_set(True)
+        if self.objects:
+            context.view_layer.objects.active = self.objects[0]
+        return self.objects
 
-def blender_matrix(transform: Transform) -> Matrix:
-    return C @ local_matrix(transform) @ C_INV
+    # .................................................................. objects
+    def _local(self, node: SceneObject, transform: Transform | None = None) -> np.ndarray:
+        """Converted local matrix including camera / light frame fixes."""
+        matrix = self.conv.transform(local_matrix(transform or node.transform))
+        parent = node.parent
+        if parent is not None and parent.kind in FIXED_KINDS:
+            matrix = self.P_inv @ matrix
+        if node.kind in FIXED_KINDS:
+            matrix = matrix @ self.P
+        return matrix
 
+    def _create(self, node: SceneObject, parent_obj: bpy.types.Object | None, parent_world: np.ndarray) -> None:
+        plan = self.plan
+        assert plan is not None
+        group = plan.group_of.get(id(node))
+        if group is not None:
+            arm = self._armature_object(group, parent_obj, parent_world)
+            world = self.world[id(group)] @ plan.rest_arm[id(node)]
+            self.world[id(node)] = world
+            if node.mesh is not None or node.camera is not None or node.light is not None:
+                # The bone's own geometry (bone display boxes, deformer meshes) rides on the bone.
+                obj = self._make_object(node)
+                if obj.type == "MESH" and not obj.data.uv_layers and not node.mesh.envelope_weights:
+                    # Bone display geometry (3ds Max bone boxes, helper shapes): keep, but out of renders.
+                    obj.display_type = "WIRE"
+                    obj.hide_render = True
+                    obj["softimage_bone_display"] = True
+                basis = self.P.copy() if node.kind in FIXED_KINDS else np.eye(4)
+                obj.matrix_basis = to_matrix(basis)
+                self.bone_children.append((obj, node, basis))
+                self.made[id(node)] = obj
+            for child in node.children:
+                if id(child) in plan.group_of:
+                    self._create(child, arm, parent_world)
+                else:
+                    self._create_bone_child(child, node)
+            return
+        obj = self._make_object(node)
+        self.made[id(node)] = obj
+        if parent_obj is not None:
+            obj.parent = parent_obj
+        basis = self._place(node, obj, parent_world)
+        world = parent_world @ basis
+        self.world[id(node)] = world
+        for child in node.children:
+            self._create(child, obj, world)
 
-class ImageResolver:
-    def __init__(self, source_path: str, search: bool):
-        self.source_path = Path(source_path).resolve()
-        self.search = search
-        self._cache: dict[str, Path | None] = {}
-        self._search_roots = self._roots()
+    def _create_bone_child(self, node: SceneObject, bone_node: SceneObject) -> None:
+        """A non-bone node below a bone: an object parented to that bone."""
+        obj = self._make_object(node)
+        self.made[id(node)] = obj
+        parent_world = self.world[id(bone_node)]
+        basis = self._place(node, obj, parent_world)
+        self.bone_children.append((obj, bone_node, basis))
+        world = parent_world @ basis
+        self.world[id(node)] = world
+        for child in node.children:
+            self._create(child, obj, world)
 
-    def _roots(self) -> list[Path]:
-        source_dir = self.source_path.parent
-        roots = [source_dir, source_dir / "Pictures", source_dir.parent / "Pictures"]
-        cursor = source_dir
-        while cursor.parent != cursor:
-            if cursor.name.casefold() == "scenes":
-                roots.extend((cursor.parent, cursor.parent / "Pictures"))
-                break
-            cursor = cursor.parent
-        unique: list[Path] = []
-        for root in roots:
-            if root not in unique:
-                unique.append(root)
-        return unique
+    def _basis_matrix(self, node: SceneObject, parent_world: np.ndarray) -> np.ndarray:
+        look = self._look_at(node)
+        if look is not None:
+            return np.linalg.inv(parent_world) @ look
+        return self._local(node)
 
-    def resolve(self, filename: str) -> Path | None:
-        normalized = filename.replace("[Project Path]", "", 1).replace("\\", os.sep)
-        requested = Path(normalized)
-        key = requested.name.casefold()
-        if key in self._cache:
-            return self._cache[key]
-        candidates = [requested] if requested.is_absolute() else []
-        candidates.extend(root / requested for root in self._search_roots)
-        candidates.extend(root / requested.name for root in self._search_roots)
-        for candidate in candidates:
-            if candidate.is_file():
-                resolved = candidate.resolve()
-                self._cache[key] = resolved
-                return resolved
-        if self.search:
-            for root in self._search_roots:
-                found = self._find_bounded(root, key)
-                if found:
-                    self._cache[key] = found
-                    return found
-        self._cache[key] = None
-        return None
+    def _place(self, node: SceneObject, obj: bpy.types.Object, parent_world: np.ndarray) -> np.ndarray:
+        basis = self._basis_matrix(node, parent_world)
+        self._apply_basis(obj, node, basis)
+        return basis
 
-    @staticmethod
-    def _find_bounded(root: Path, basename: str, max_depth: int = 4) -> Path | None:
-        if not root.is_dir():
+    def _apply_basis(self, obj: bpy.types.Object, node: SceneObject, basis: np.ndarray) -> None:
+        simple = self._channel_compatible(node)
+        if simple:
+            transform = node.transform
+            obj.location = self.conv.points(np.array([transform.position]))[0]
+            if transform.quaternion is not None:
+                obj.rotation_mode = "QUATERNION"
+                w, x, y, z = transform.quaternion
+                vector = self.conv.directions(np.array([[x, y, z]]))[0]
+                obj.rotation_quaternion = (w, *vector)
+            else:
+                obj.rotation_mode = self.conv.euler_order(transform.rotation_order)
+                rotation = [0.0, 0.0, 0.0]
+                for source_axis, angle in enumerate(transform.rotation):
+                    axis, sign = self.conv.axis_map()[source_axis]
+                    rotation[axis] = math.radians(angle) * sign
+                obj.rotation_euler = rotation
+            scale = [1.0, 1.0, 1.0]
+            for source_axis, value in enumerate(transform.scale):
+                scale[self.conv.axis_map()[source_axis][0]] = value
+            obj.scale = scale
+        else:
+            obj.rotation_mode = "QUATERNION"
+            obj.matrix_basis = to_matrix(basis)
+
+    def _channel_compatible(self, node: SceneObject) -> bool:
+        """Whether the node's transform maps component-wise to Blender loc / rot / scale."""
+        if node.kind in FIXED_KINDS or self._look_at(node) is not None:
+            return False
+        parent = node.parent
+        return parent is None or parent.kind not in FIXED_KINDS
+
+    def _look_at(self, node: SceneObject) -> np.ndarray | None:
+        """Blender world matrix for cameras / lights given by position and interest."""
+        settings = node.camera if node.camera is not None else node.light
+        if settings is None or settings.position is None or settings.target is None:
             return None
-        root_depth = len(root.parts)
-        for current, directories, files in os.walk(root):
-            depth = len(Path(current).parts) - root_depth
-            if depth >= max_depth:
-                directories[:] = []
-            match = next((name for name in files if name.casefold() == basename), None)
-            if match:
-                return (Path(current) / match).resolve()
-        return None
+        parent_world = self.world.get(id(node.parent), np.eye(4)) if node.parent else np.eye(4)
+        position = parent_world @ np.append(self.conv.points(np.array([settings.position]))[0], 1.0)
+        target = parent_world @ np.append(self.conv.points(np.array([settings.target]))[0], 1.0)
+        direction = target[:3] - position[:3]
+        if np.linalg.norm(direction) < 1e-9:
+            direction = np.array([0.0, 0.0, -1.0])
+        forward = direction / np.linalg.norm(direction)
+        up = np.array([0.0, 0.0, 1.0])
+        if abs(np.dot(forward, up)) > 0.999:
+            up = np.array([0.0, 1.0, 0.0])
+        right = np.cross(forward, up)
+        right /= np.linalg.norm(right)
+        true_up = np.cross(right, forward)
+        rotation = np.column_stack((right, true_up, -forward))
+        roll = getattr(settings, "roll", 0.0)
+        if roll:
+            rotation = rotation @ convert.euler_matrices(np.array([[0.0, 0.0, roll]]))[0]
+        out = np.eye(4)
+        out[:3, :3] = rotation
+        out[:3, 3] = position[:3]
+        return out
 
-
-def build(
-    context,
-    scene: Scene,
-    *,
-    import_materials: bool,
-    import_textures: bool,
-    search_textures: bool,
-    import_animation: bool,
-    use_collection: bool,
-    report: Report,
-) -> list[bpy.types.Object]:
-    collection = context.collection
-    if use_collection:
-        collection = bpy.data.collections.new(Path(scene.source_path).stem or scene.name)
-        context.collection.children.link(collection)
-    for obj in context.selected_objects:
-        obj.select_set(False)
-    resolver = ImageResolver(scene.source_path, search_textures)
-    materials = (
-        _build_materials(scene, resolver, import_textures, report)
-        if import_materials
-        else {}
-    )
-    made: dict[int, bpy.types.Object] = {}
-    objects: list[bpy.types.Object] = []
-    absolute: list[tuple[bpy.types.Object, SceneObject]] = []
-
-    def walk(source: SceneObject, parent: bpy.types.Object | None) -> None:
-        obj = _make_object(source, scene, materials, collection, report)
-        made[id(source)] = obj
-        objects.append(obj)
-        if parent:
-            obj.parent = parent
-        obj.rotation_mode = source.transform.rotation_order
-        obj.matrix_basis = blender_matrix(source.transform)
-        if not source.visible:
-            obj.hide_viewport = True
-            obj.hide_render = True
-        obj["softimage_template"] = source.source_template
-        if (
-            source.camera
-            and source.camera.position is not None
-            and source.camera.target is not None
-        ) or (
-            source.light
-            and source.light.position is not None
-            and source.light.target is not None
-        ):
-            absolute.append((obj, source))
-        for child in source.children:
-            walk(child, obj)
-
-    for root in scene.objects:
-        walk(root, None)
-    for obj, source in absolute:
-        if source.camera:
-            obj.matrix_world = _look_at(
-                source.camera.position,
-                source.camera.target,
-                source.camera.roll,
-            )
-        elif source.light:
-            obj.matrix_world = _look_at(source.light.position, source.light.target, 0.0)
-    if import_animation:
-        current_frame = context.scene.frame_current
-        for source in scene.walk():
-            if source.animation:
-                _animate_object(made[id(source)], source, report)
-        context.scene.frame_start = int(scene.frame_start)
-        context.scene.frame_end = int(scene.frame_end)
-        if scene.frame_rate > 0:
-            context.scene.render.fps = round(scene.frame_rate)
-            context.scene.render.fps_base = (
-                round(scene.frame_rate) / scene.frame_rate
-                if not scene.frame_rate.is_integer()
-                else 1.0
-            )
-        context.scene.frame_set(current_frame)
-    for obj in objects:
-        obj.select_set(True)
-    if objects:
-        context.view_layer.objects.active = objects[0]
-    return objects
-
-
-def _make_object(
-    source: SceneObject,
-    scene: Scene,
-    materials: dict[str, bpy.types.Material],
-    collection: bpy.types.Collection,
-    report: Report,
-) -> bpy.types.Object:
-    if source.kind == "MESH" and source.mesh is not None:
-        data = _make_mesh(source, scene, materials, report)
-    elif source.kind == "CAMERA" and source.camera is not None:
-        data = _make_camera(source)
-    elif source.kind == "LIGHT" and source.light is not None:
-        data = _make_light(source)
-    else:
+    def _make_object(self, node: SceneObject) -> bpy.types.Object:
         data = None
-    obj = bpy.data.objects.new(source.name, data)
-    collection.objects.link(obj)
-    if source.mesh is not None:
-        for group_name, weights in source.mesh.envelope_weights.items():
-            group = obj.vertex_groups.new(name=group_name)
-            for vertex, weight in weights:
-                group.add([vertex], weight, "REPLACE")
-    if source.kind == "BONE":
-        obj.empty_display_type = "SINGLE_ARROW"
-        obj.empty_display_size = source.bone_length or 1.0
-        obj["softimage_bone"] = True
-    return obj
+        if node.mesh is not None and node.kind in {"MESH", "BONE", "EMPTY", "MODEL"} and len(node.mesh.points):
+            data = self._make_mesh(node)
+        elif node.camera is not None:
+            data = self._make_camera(node)
+        elif node.light is not None:
+            data = self._make_light(node)
+        obj = bpy.data.objects.new(node.name, data)
+        self.collection.objects.link(obj)
+        self.objects.append(obj)
+        if data is None:
+            obj.empty_display_size = max(0.05, 0.5 * self.conv.scale)
+            if node.kind == "BONE":
+                obj.empty_display_type = "SINGLE_ARROW"
+                obj.empty_display_size = (node.bone_length or 1.0) * self.conv.scale
+        if node.mesh is not None and data is not None:
+            mesh = node.mesh
+            if mesh.envelope_weights:
+                blender_mesh.add_vertex_groups(obj, mesh.envelope_weights)
+            for cluster_name, (kind, indices) in mesh.clusters.items():
+                if kind == "POINT":
+                    blender_mesh.add_vertex_groups(
+                        obj, {cluster_name: (indices, np.ones(len(indices)))}
+                    )
+            if mesh.shape_keys:
+                self.shape_key_names[id(node)] = blender_mesh.add_shape_keys(obj, mesh, self.conv)
+        if not node.visible:
+            obj.hide_set(True)
+        if not node.visible or not node.render_visible:
+            obj.hide_render = True
+        obj["softimage_template"] = node.source_template
+        for key, value in node.properties.items():
+            if key.startswith("_"):
+                continue
+            try:
+                obj[key[:63]] = value
+            except (TypeError, ValueError, OverflowError):
+                obj[key[:63]] = str(value)
+        return obj
 
+    def _make_mesh(self, node: SceneObject) -> bpy.types.Mesh:
+        source = node.mesh
+        assert source is not None
+        mesh, _kept = blender_mesh.build_mesh(node.name, source, self.conv, self.report)
+        names = list(source.material_names)
+        if not names and node.material:
+            names = [node.material]
+        if self.options.import_materials:
+            for name in names:
+                material = self._material(name)
+                if material is not None:
+                    mesh.materials.append(material)
+        return mesh
 
-def _make_mesh(
-    source: SceneObject,
-    scene: Scene,
-    materials: dict[str, bpy.types.Material],
-    report: Report,
-) -> bpy.types.Mesh:
-    source_mesh = source.mesh
-    assert source_mesh is not None
-    mesh = bpy.data.meshes.new(source.name)
-    mesh.from_pydata(
-        [convert_point(point) for point in source_mesh.points],
-        [],
-        source_mesh.polygons,
-    )
-    mesh.update()
-    loop_count = len(mesh.loops)
-    if source_mesh.corner_normals:
-        if len(source_mesh.corner_normals) == loop_count:
-            normals = [convert_point(normal) for normal in source_mesh.corner_normals]
-            mesh.normals_split_custom_set(normals)
-        else:
-            report(
-                {"WARNING"},
-                f"{source.name}: skipped {len(source_mesh.corner_normals)} corner normals "
-                f"for {loop_count} mesh loops.",
-            )
-    for name, values in source_mesh.uv_layers.items():
-        if len(values) != loop_count:
-            report(
-                {"WARNING"},
-                f"{source.name}: skipped UV set {name!r}; it has {len(values)} values "
-                f"for {loop_count} mesh loops.",
-            )
-            continue
-        layer = mesh.uv_layers.new(name=name or "UVMap")
-        layer.data.foreach_set("uv", [component for uv in values for component in uv])
-    for name, values in source_mesh.color_layers.items():
-        if len(values) != loop_count:
-            report(
-                {"WARNING"},
-                f"{source.name}: skipped color set {name!r}; it has {len(values)} values "
-                f"for {loop_count} mesh loops.",
-            )
-            continue
-        layer = mesh.color_attributes.new(
-            name=name or "Color",
-            type="FLOAT_COLOR",
-            domain="CORNER",
-        )
-        layer.data.foreach_set(
-            "color", [component for color in values for component in color]
-        )
-    material_names = list(dict.fromkeys(source_mesh.face_materials))
-    if not material_names and source.material:
-        material_names = [source.material]
-    slots: dict[str, int] = {}
-    for material_name in material_names:
-        material = _ensure_material(materials, material_name, report)
-        mesh.materials.append(material)
-        slots[material_name] = len(mesh.materials) - 1
-    for polygon, material_name in zip(mesh.polygons, source_mesh.face_materials):
-        if material_name in slots:
-            polygon.material_index = slots[material_name]
-        else:
-            material = _ensure_material(materials, material_name, report)
-            mesh.materials.append(material)
-            slots[material_name] = len(mesh.materials) - 1
-            polygon.material_index = slots[material_name]
-    return mesh
-
-
-def _make_camera(source: SceneObject) -> bpy.types.Camera:
-    settings = source.camera
-    assert settings is not None
-    camera = bpy.data.cameras.new(source.name)
-    camera.type = settings.projection
-    camera.clip_start = max(1e-6, settings.near)
-    camera.clip_end = max(camera.clip_start, settings.far)
-    if settings.projection == "ORTHO":
-        camera.ortho_scale = settings.ortho_height
-    else:
-        camera.sensor_fit = "HORIZONTAL"
-        camera.angle_x = radians(settings.field_of_view)
-    if settings.aspect:
-        camera["softimage_aspect"] = settings.aspect
-    return camera
-
-
-def _make_light(source: SceneObject) -> bpy.types.Light:
-    settings = source.light
-    assert settings is not None
-    light = bpy.data.lights.new(source.name, settings.kind)
-    light.color = settings.color
-    light.energy = LIGHT_POWER.get(settings.kind, 1000.0) * settings.intensity
-    if settings.kind == "SPOT":
-        light.spot_size = radians(settings.cone_angle)
-        if settings.cone_angle:
-            light.spot_blend = max(
-                0.0, min(1.0, settings.spread_angle / settings.cone_angle)
-            )
-    return light
-
-
-def _look_at(
-    position: tuple[float, float, float],
-    target: tuple[float, float, float],
-    roll: float,
-) -> Matrix:
-    location = Vector(convert_point(position))
-    direction = Vector(convert_point(target)) - location
-    if direction.length_squared < 1e-12:
-        direction = Vector((0.0, 0.0, -1.0))
-    rotation = direction.to_track_quat("-Z", "Y").to_matrix().to_4x4()
-    if roll:
-        rotation = rotation @ Matrix.Rotation(radians(roll), 4, "Z")
-    return Matrix.Translation(location) @ rotation
-
-
-def _find_material(
-    materials: dict[str, bpy.types.Material], name: str
-) -> bpy.types.Material | None:
-    return materials.get(name) or materials.get(name.rsplit(".", 1)[-1])
-
-
-def _ensure_material(
-    materials: dict[str, bpy.types.Material],
-    name: str,
-    report: Report,
-) -> bpy.types.Material:
-    material = _find_material(materials, name)
-    if material is not None:
-        return material
-    short_name = name.rsplit(".", 1)[-1] or "Material"
-    material = bpy.data.materials.new(short_name)
-    material["softimage_missing_definition"] = name
-    materials[name] = material
-    materials.setdefault(short_name, material)
-    report(
-        {"WARNING"},
-        f"Material {name!r} is referenced by geometry but has no definition; "
-        "created a placeholder.",
-    )
-    return material
-
-
-def _build_materials(
-    scene: Scene,
-    resolver: ImageResolver,
-    import_textures: bool,
-    report: Report,
-) -> dict[str, bpy.types.Material]:
-    made: dict[str, bpy.types.Material] = {}
-    for source in scene.materials.values():
-        material = _make_material(
-            source,
-            scene,
-            resolver,
-            import_textures,
-            report,
-        )
-        made[source.name] = material
-        made.setdefault(source.name.rsplit(".", 1)[-1], material)
-    return made
-
-
-def _make_material(
-    source: Material,
-    scene: Scene,
-    resolver: ImageResolver,
-    import_textures: bool,
-    report: Report,
-) -> bpy.types.Material:
-    material = bpy.data.materials.new(source.name.rsplit(".", 1)[-1] or source.name)
-    material.use_nodes = True
-    material.diffuse_color = source.diffuse
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
-    bsdf = nodes.get("Principled BSDF")
-    if bsdf is None:
-        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    _set_input(bsdf, "Base Color", source.diffuse)
-    _set_input(bsdf, "Roughness", source.roughness)
-    _set_input(bsdf, "Metallic", source.metallic)
-    _set_input(bsdf, "Specular Tint", (*source.specular, 1.0))
-    _set_input(bsdf, "Alpha", source.alpha)
-    if source.emission_strength:
-        _set_input(bsdf, "Emission Color", (*source.emission, 1.0))
-        _set_input(bsdf, "Emission Strength", source.emission_strength)
-    material["softimage_shader"] = source.shader
-    if import_textures and source.image:
-        filename = scene.images.get(source.image, source.image)
-        found = resolver.resolve(filename)
-        texture = nodes.new("ShaderNodeTexImage")
-        texture.label = filename
-        if found:
-            texture.image = bpy.data.images.load(str(found), check_existing=True)
-            links.new(texture.outputs["Color"], bsdf.inputs["Base Color"])
-            if source.alpha < 1.0 and texture.outputs.get("Alpha"):
-                links.new(texture.outputs["Alpha"], bsdf.inputs["Alpha"])
-        else:
-            material["softimage_missing_image"] = filename
-            report(
-                {"WARNING"},
-                f"Material {material.name}: image file not found: {filename}",
-            )
-    return material
-
-
-def _set_input(node, name: str, value) -> None:
-    socket = node.inputs.get(name)
-    if socket is None:
-        return
-    if isinstance(value, tuple):
-        current = socket.default_value
-        length = len(current) if hasattr(current, "__len__") else len(value)
-        socket.default_value = (value + (1.0,) * length)[:length]
-    else:
-        socket.default_value = value
-
-
-def _animate_object(
-    obj: bpy.types.Object,
-    source: SceneObject,
-    report: Report,
-) -> None:
-    channels = {
-        mapping: curve
-        for curve in source.animation
-        if (mapping := _channel_mapping(curve.channel)) is not None and curve.keys
-    }
-    if not channels:
-        report(
-            {"WARNING"},
-            f"{source.name}: no supported transform channels were found in its F-curves.",
-        )
-        return
-    frames = sorted({key[0] for curve in channels.values() for key in curve.keys})
-    samples: list[tuple[float, tuple[Vector, Euler, Vector]]] = []
-    for frame in frames:
-        position = list(source.transform.position)
-        rotation = list(source.transform.rotation)
-        scale = list(source.transform.scale)
-        destinations = {"location": position, "rotation_euler": rotation, "scale": scale}
-        for (data_path, index), curve in channels.items():
-            destinations[data_path][index] = _sample_curve(curve, frame)
-        transform = Transform(
-            position=tuple(position),
-            rotation=tuple(rotation),
-            scale=tuple(scale),
-            rotation_order=source.transform.rotation_order,
-        )
-        matrix = blender_matrix(transform)
-        location, quaternion, converted_scale = matrix.decompose()
-        converted_rotation = quaternion.to_euler(source.transform.rotation_order)
-        samples.append((frame, (location, converted_rotation, converted_scale)))
-    action = bpy.data.actions.new(f"{source.name} Action")
-    animation_data = obj.animation_data_create()
-    interpolation = (
-        "CONSTANT"
-        if all("CONSTANT" in curve.interpolation.upper() for curve in channels.values())
-        else "LINEAR"
-    )
-    if hasattr(action, "slots"):
-        slot = action.slots.new(obj.id_type, obj.name)
-        layer = action.layers.new("Softimage")
-        strip = layer.strips.new(type="KEYFRAME")
-        channel_bag = strip.channelbag(slot, ensure=True)
-        for data_path, value_index in (
-            ("location", 0),
-            ("rotation_euler", 1),
-            ("scale", 2),
-        ):
-            for component in range(3):
-                fcurve = channel_bag.fcurves.new(
-                    data_path=data_path,
-                    index=component,
-                )
-                fcurve.keyframe_points.add(len(samples))
-                for point, (frame, values) in zip(fcurve.keyframe_points, samples):
-                    point.co = (frame, values[value_index][component])
-                    point.interpolation = interpolation
-                fcurve.update()
-        animation_data.action = action
-        animation_data.action_slot = slot
-    else:
-        for data_path, value_index in (
-            ("location", 0),
-            ("rotation_euler", 1),
-            ("scale", 2),
-        ):
-            for component in range(3):
-                fcurve = action.fcurves.new(data_path=data_path, index=component)
-                fcurve.keyframe_points.add(len(samples))
-                for point, (frame, values) in zip(fcurve.keyframe_points, samples):
-                    point.co = (frame, values[value_index][component])
-                    point.interpolation = interpolation
-                fcurve.update()
-        animation_data.action = action
-
-
-def _channel_mapping(channel: str) -> tuple[str, int] | None:
-    normalized = reformat = (
-        channel.upper()
-        .replace("_", "-")
-        .replace(".", "-")
-        .replace(" ", "-")
-    )
-    aliases = {
-        "POS": "TRANSLATION",
-        "POSITION": "TRANSLATION",
-        "TRANS": "TRANSLATION",
-        "ROT": "ROTATION",
-        "SCL": "SCALING",
-        "SCALE": "SCALING",
-    }
-    parts = [part for part in reformat.split("-") if part]
-    if len(parts) < 2:
-        for prefix in ("POS", "ROT", "SCL"):
-            if normalized.startswith(prefix) and normalized[-1:] in "XYZ":
-                parts = [prefix, normalized[-1]]
-                break
-    if len(parts) < 2 or parts[-1] not in {"X", "Y", "Z"}:
+    def _material(self, name: str):
+        if self.material_lookup is not None:
+            return self.material_lookup(name)
+        if self.materials is not None:
+            return self.materials.get(name)
         return None
-    kind = aliases.get(parts[0], parts[0])
-    data_path = {
-        "TRANSLATION": "location",
-        "ROTATION": "rotation_euler",
-        "SCALING": "scale",
-    }.get(kind)
-    if data_path is None:
-        return None
-    return data_path, "XYZ".index(parts[-1])
+
+    def _make_camera(self, node: SceneObject) -> bpy.types.Camera:
+        settings = node.camera
+        assert settings is not None
+        camera = bpy.data.cameras.new(node.name)
+        camera.type = settings.projection
+        camera.clip_start = max(1e-6, settings.near * self.conv.scale)
+        camera.clip_end = max(camera.clip_start, settings.far * self.conv.scale)
+        if settings.projection == "ORTHO":
+            camera.ortho_scale = settings.ortho_height * self.conv.scale
+        elif settings.field_of_view:
+            fov = math.radians(max(0.01, min(179.0, settings.field_of_view)))
+            if settings.fov_type == "VERTICAL":
+                camera.sensor_fit = "VERTICAL"
+                camera.angle_y = fov
+            else:
+                camera.sensor_fit = "HORIZONTAL"
+                camera.angle_x = fov
+        if settings.aspect:
+            camera["softimage_aspect"] = settings.aspect
+        return camera
+
+    def _make_light(self, node: SceneObject) -> bpy.types.Light:
+        settings = node.light
+        assert settings is not None
+        light = bpy.data.lights.new(node.name, settings.kind)
+        light.color = settings.color
+        light.energy = LIGHT_POWER.get(settings.kind, 1000.0) * settings.intensity
+        if hasattr(light, "use_shadow"):
+            light.use_shadow = settings.shadows
+        if settings.kind == "SPOT":
+            light.spot_size = math.radians(max(1.0, min(180.0, settings.cone_angle)))
+            if settings.cone_angle:
+                light.spot_blend = max(0.0, min(1.0, settings.spread_angle / settings.cone_angle))
+        return light
+
+    # .................................................................. armatures
+    def _armature_object(self, group: skeleton.Group, parent_obj, parent_world: np.ndarray) -> bpy.types.Object:
+        arm = self.armatures.get(id(group))
+        if arm is not None:
+            return arm
+        data = bpy.data.armatures.new(group.name)
+        data.display_type = "STICK" if len(group.nodes) > 60 else "OCTAHEDRAL"
+        arm = bpy.data.objects.new(group.name, data)
+        self.collection.objects.link(arm)
+        self.objects.append(arm)
+        if parent_obj is not None:
+            arm.parent = parent_obj
+        arm.show_in_front = True
+        self.armatures[id(group)] = arm
+        self.armature_groups[arm.as_pointer()] = group
+        self.world[id(group)] = parent_world
+        return arm
+
+    def _build_armature(self, group: skeleton.Group) -> None:
+        plan = self.plan
+        assert plan is not None
+        arm = self.armatures.get(id(group))
+        if arm is None:
+            return
+        view_layer = self.context.view_layer
+        view_layer.objects.active = arm
+        arm.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit_bones = arm.data.edit_bones
+        for node in group.nodes:
+            bone = edit_bones.new(node.name[:63])
+            length = plan.length[id(node)]
+            bone.head = (0.0, 0.0, 0.0)
+            bone.tail = (0.0, length, 0.0)
+            bone.matrix = to_matrix(plan.bone_rest[id(node)])
+            bone.use_deform = True
+            self.bone_names[id(node)] = bone.name
+        for node in group.nodes:
+            parent = plan.bone_parent.get(id(node))
+            if parent is not None:
+                edit_bones[self.bone_names[id(node)]].parent = edit_bones[self.bone_names[id(parent)]]
+        bpy.ops.object.mode_set(mode="OBJECT")
+        arm.select_set(False)
+        for node in group.nodes:
+            bone = arm.data.bones.get(self.bone_names[id(node)])
+            if bone is not None and node.bone_role:
+                bone["softimage_role"] = node.bone_role
+            pose_bone = arm.pose.bones.get(self.bone_names[id(node)])
+            if pose_bone is not None:
+                pose_bone.rotation_mode = "QUATERNION"
+                static = plan.static_basis.get(id(node))
+                if static is not None:
+                    loc, quat, scale = convert.decompose(static[None])
+                    pose_bone.location = loc[0]
+                    pose_bone.rotation_quaternion = quat[0]
+                    pose_bone.scale = scale[0]
+
+    def _parent_to_bones(self) -> None:
+        plan = self.plan
+        assert plan is not None
+        for obj, bone_node, basis in self.bone_children:
+            group = plan.group_of[id(bone_node)]
+            arm = self.armatures[id(group)]
+            obj.parent = arm
+            obj.parent_type = "BONE"
+            obj.parent_bone = self.bone_names[id(bone_node)]
+            offset = np.eye(4)
+            offset[1, 3] = -plan.length[id(bone_node)]
+            obj.matrix_parent_inverse = to_matrix(offset @ R_BONE_INV)
+
+    def _deformers(self) -> None:
+        """Armature modifiers for enveloped meshes whose deformers became bones."""
+        if not self.armatures:
+            return
+        bone_owner: dict[str, bpy.types.Object] = {}
+        plan = self.plan
+        assert plan is not None
+        for group in plan.groups:
+            arm = self.armatures.get(id(group))
+            for node in group.nodes:
+                bone_owner.setdefault(node.name.casefold(), arm)
+                bone_owner.setdefault(node.name.rsplit(".", 1)[-1].casefold(), arm)
+        for node in self.scene.walk():
+            if node.mesh is None or not node.mesh.envelope_weights:
+                continue
+            obj = self.made.get(id(node))
+            if obj is None or obj.type != "MESH":
+                continue
+            arms = {bone_owner.get(name.casefold()) for name in node.mesh.envelope_weights}
+            arms.discard(None)
+            for arm in arms:
+                modifier = obj.modifiers.new("Softimage Envelope", "ARMATURE")
+                modifier.object = arm
+            if len(arms) == 1 and obj.parent_type == "BONE":
+                # An enveloped mesh must not also follow a bone (Softimage envelopes ignore the motion of
+                # the mesh's parents): keep its rest placement, parented to the armature object.
+                arm = next(iter(arms))
+                arm_world = self.world[id(self.armature_groups[arm.as_pointer()])]
+                obj.parent = arm
+                obj.parent_type = "OBJECT"
+                obj.matrix_parent_inverse = Matrix.Identity(4)
+                obj.matrix_basis = to_matrix(np.linalg.inv(arm_world) @ self.world[id(node)])
+            # Vertex group names must match Blender bone names (which may have been truncated).
+            by_name = {n.name.casefold(): n for n in plan.all_nodes}
+            for name in node.mesh.envelope_weights:
+                target = by_name.get(name.casefold())
+                if target is not None and id(target) in self.bone_names:
+                    group = obj.vertex_groups.get(name[:63])
+                    if group is not None:
+                        group.name = self.bone_names[id(target)]
+
+    # .................................................................. animation
+    def _animate(self) -> None:
+        scene = self.scene
+        stem = Path(scene.source_path).stem or scene.name
+        names = sorted({a.name for a in scene.actions})
+        action_name = stem if len(names) != 1 else f"{stem}|{names[0]}"
+        writer = blender_anim.ActionWriter(action_name)
+        plan = self.plan
+        assert plan is not None
+        for node in scene.walk():
+            curves = [c for c in node.animation if c.prop is not None and len(c.frames)]
+            if not curves:
+                continue
+            if id(node) in plan.group_of:
+                continue    # bones are sampled per armature below
+            obj = self.made.get(id(node))
+            if obj is None:
+                continue
+            self._animate_object(writer, node, obj, curves)
+        for group in plan.groups:
+            self._animate_armature(writer, group)
+        if self.options.import_shape_animation:
+            for node in scene.walk():
+                if node.mesh is not None and node.mesh.shape_keys and id(node) in self.made:
+                    self._animate_shapes(writer, node, self.made[id(node)])
+        starts = [a.start for a in scene.actions if a.start is not None]
+        ends = [a.end for a in scene.actions if a.end is not None]
+        action = writer.finish(
+            min(starts) if starts else scene.frame_start, max(ends) if ends else scene.frame_end
+        )
+        if action is not None:
+            action["softimage_clips"] = ", ".join(names)
+            if self.options.set_scene_frames:
+                self._set_scene_frames()
+
+    def _set_scene_frames(self) -> None:
+        scene, target = self.scene, self.context.scene
+        target.frame_start = int(math.floor(scene.frame_start))
+        target.frame_end = max(target.frame_start, int(math.ceil(scene.frame_end)))
+        if scene.frame_rate > 0:
+            fps = round(scene.frame_rate)
+            target.render.fps = max(1, fps)
+            target.render.fps_base = fps / scene.frame_rate if fps else 1.0
+
+    def _animate_object(self, writer, node: SceneObject, obj, curves: list[AnimationCurve]) -> None:
+        transform_curves = [c for c in curves if c.prop in {"location", "rotation", "scale"}]
+        if transform_curves:
+            if self._channel_compatible(node) and node.transform.quaternion is None:
+                for curve in transform_curves:
+                    self._write_remapped(writer, obj, curve)
+            else:
+                self._write_sampled_object(writer, node, obj, transform_curves)
+        for curve in curves:
+            if curve.prop == "visibility":
+                hidden = (np.asarray(curve.values) < 0.5).astype(np.float64)
+                for path in ("hide_viewport", "hide_render"):
+                    writer.add_curve(obj, path, 0, curve.frames, hidden, "CONSTANT", group=obj.name)
+
+    def _write_remapped(self, writer, obj, curve: AnimationCurve) -> None:
+        axis, factor = self.conv.channel(curve.prop, curve.index)
+        if curve.prop == "rotation":
+            factor *= math.pi / 180.0
+            path = "rotation_euler"
+        else:
+            path = curve.prop
+        values = np.asarray(curve.values) * factor
+        left = right = None
+        if curve.handles_left is not None and curve.handles_right is not None:
+            left = np.column_stack((curve.handles_left[:, 0], curve.handles_left[:, 1] * factor))
+            right = np.column_stack((curve.handles_right[:, 0], curve.handles_right[:, 1] * factor))
+        writer.add_curve(obj, path, axis, curve.frames, values, curve.interpolation, left, right,
+                         group=obj.name)
+
+    def _sample_frames(self, curves: list[AnimationCurve]) -> np.ndarray:
+        frames = np.unique(np.concatenate([np.asarray(c.frames) for c in curves]))
+        smooth = any(c.handles_left is not None or c.interpolation.upper() in {"CUBIC", "HERMITE", "BEZIER"}
+                     for c in curves)
+        if smooth and len(frames) > 1:
+            dense = np.arange(math.floor(frames[0]), math.ceil(frames[-1]) + 1, 1.0)
+            frames = np.unique(np.concatenate((frames, dense)))
+        return frames
+
+    def _sample_local(self, node: SceneObject, curves: list[AnimationCurve], frames: np.ndarray) -> np.ndarray:
+        """Node-local Softimage matrices (F, 4, 4) at the given frames."""
+        transform = node.transform
+        count = len(frames)
+        channels = {
+            "location": np.tile(np.asarray(transform.position, dtype=np.float64), (count, 1)),
+            "rotation": np.tile(np.asarray(transform.rotation, dtype=np.float64), (count, 1)),
+            "scale": np.tile(np.asarray(transform.scale, dtype=np.float64), (count, 1)),
+        }
+        rotation_animated = False
+        for curve in curves:
+            if curve.prop in channels and 0 <= curve.index < 3:
+                channels[curve.prop][:, curve.index] = curve.evaluate(frames)
+                rotation_animated |= curve.prop == "rotation"
+        if transform.quaternion is not None and not rotation_animated:
+            rotation = np.broadcast_to(convert.quaternion_matrices(np.asarray(transform.quaternion)[None]),
+                                       (count, 3, 3))
+        else:
+            rotation = convert.euler_matrices(channels["rotation"], transform.rotation_order)
+        return convert.compose(channels["location"], rotation, channels["scale"])
+
+    def _write_sampled_object(self, writer, node: SceneObject, obj, curves) -> None:
+        frames = self._sample_frames(curves)
+        local = self.conv.transform(self._sample_local(node, curves, frames))
+        parent = node.parent
+        if parent is not None and parent.kind in FIXED_KINDS:
+            local = self.P_inv @ local
+        if node.kind in FIXED_KINDS:
+            local = local @ self.P
+        obj.rotation_mode = "QUATERNION"
+        locations, quaternions, scales = convert.decompose(local)
+        mode = "CONSTANT" if all("CONSTANT" in c.interpolation.upper() for c in curves) else "LINEAR"
+        for index in range(3):
+            writer.add_curve(obj, "location", index, frames, locations[:, index], mode, group=obj.name)
+            writer.add_curve(obj, "scale", index, frames, scales[:, index], mode, group=obj.name)
+        for index in range(4):
+            writer.add_curve(obj, "rotation_quaternion", index, frames, quaternions[:, index], mode,
+                             group=obj.name)
+
+    def _animate_armature(self, writer, group: skeleton.Group) -> None:
+        plan = self.plan
+        assert plan is not None
+        arm = self.armatures.get(id(group))
+        if arm is None:
+            return
+        animated = [
+            (node, [c for c in node.animation if c.prop in {"location", "rotation", "scale"} and len(c.frames)])
+            for node in group.nodes
+        ]
+        animated = [(node, curves) for node, curves in animated if curves]
+        if not animated:
+            return
+        frames = self._sample_frames([c for _, curves in animated for c in curves])
+        mode = "CONSTANT" if all(
+            "CONSTANT" in c.interpolation.upper() for _, curves in animated for c in curves
+        ) else "LINEAR"
+        for node, curves in animated:
+            local = self.conv.transform(self._sample_local(node, curves, frames))
+            bone_rest = plan.bone_rest[id(node)]
+            parent = plan.bone_parent.get(id(node))
+            if parent is not None:
+                pose = plan.bone_rest[id(parent)] @ R_BONE_INV @ local @ R_BONE
+            else:
+                pose = local @ R_BONE
+            basis = np.linalg.inv(bone_rest) @ pose
+            locations, quaternions, scales = convert.decompose(basis)
+            name = self.bone_names[id(node)]
+            prefix = f'pose.bones["{bpy.utils.escape_identifier(name)}"]'
+            for index in range(3):
+                if not blender_anim.drop_constant_identity(locations[:, index], 0.0, 1e-5 * self.conv.scale):
+                    writer.add_curve(arm, f"{prefix}.location", index, frames, locations[:, index], mode,
+                                     group=name)
+                if not blender_anim.drop_constant_identity(scales[:, index], 1.0):
+                    writer.add_curve(arm, f"{prefix}.scale", index, frames, scales[:, index], mode,
+                                     group=name)
+            identity = (1.0, 0.0, 0.0, 0.0)
+            if not all(blender_anim.drop_constant_identity(quaternions[:, i], identity[i]) for i in range(4)):
+                for index in range(4):
+                    writer.add_curve(arm, f"{prefix}.rotation_quaternion", index, frames,
+                                     quaternions[:, index], mode, group=name)
+
+    def _animate_shapes(self, writer, node: SceneObject, obj) -> None:
+        mesh = node.mesh
+        names = self.shape_key_names.get(id(node)) or []
+        key = obj.data.shape_keys
+        if key is None or not names:
+            return
+        driver = next((c for c in node.animation if c.prop == "shape_animation"), None)
+        constant = "CONSTANT" in mesh.shape_interpolation
+        if driver is not None:
+            frames = np.asarray(driver.frames, dtype=np.float64)
+            values = np.asarray(driver.values, dtype=np.float64)
+            numbers = []
+            for shape in mesh.shape_keys:
+                digits = "".join(ch for ch in shape.name if ch.isdigit())
+                numbers.append(float(digits) if digits else None)
+        else:
+            order = [s.frame for s in mesh.shape_keys]
+            frames = np.asarray([f if f is not None else i for i, f in enumerate(order)], dtype=np.float64)
+            values = np.arange(len(frames), dtype=np.float64)
+            numbers = list(values)
+        for number, name in zip(numbers, names):
+            if name is None or number is None:
+                continue
+            distance = np.abs(values - number)
+            near = distance <= 1.0 + 1e-9
+            if not near.any():
+                continue
+            weights = np.clip(1.0 - distance[near], 0.0, 1.0)
+            if constant:
+                weights = (distance[near] < 0.5).astype(np.float64)
+            path = f'key_blocks["{bpy.utils.escape_identifier(name)}"].value'
+            writer.add_curve(key, path, 0, frames[near], weights, "CONSTANT" if constant else "LINEAR")
 
 
-def _sample_curve(curve: AnimationCurve, frame: float) -> float:
-    keys = sorted(curve.keys, key=lambda item: item[0])
-    if frame <= keys[0][0]:
-        return keys[0][1]
-    if frame >= keys[-1][0]:
-        return keys[-1][1]
-    for left, right in zip(keys, keys[1:]):
-        if left[0] <= frame <= right[0]:
-            if "CONSTANT" in curve.interpolation.upper() or right[0] == left[0]:
-                return left[1]
-            factor = (frame - left[0]) / (right[0] - left[0])
-            return left[1] + (right[1] - left[1]) * factor
-    return keys[-1][1]
+def build(context, scene: Scene, *, report: Report, options: ImportOptions | None = None,
+          material_lookup=None, **legacy) -> list[bpy.types.Object]:
+    """Build Blender data for a parsed scene. Keyword arguments of earlier versions
+    (import_materials=..., use_collection=...) are accepted and mapped onto ImportOptions."""
+    options = options or ImportOptions()
+    for key, value in legacy.items():
+        if hasattr(options, key):
+            setattr(options, key, value)
+    return SceneBuilder(context, scene, options, report, material_lookup).build()

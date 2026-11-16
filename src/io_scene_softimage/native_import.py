@@ -1,237 +1,297 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Blender adapter for the vendored native Softimage scene reader."""
+"""Native .scn / .emdl scenes: conversion of the vendored reader's result into `model.Scene`.
+
+The conversion is Blender independent (`to_model`); `build` then hands the scene to the shared
+`blender_scene.SceneBuilder`, with native render-tree materials supplied by `native_materials`.
+"""
 
 from __future__ import annotations
 
-from math import radians
+import math
+from pathlib import Path
 
-import bpy
-from mathutils import Euler, Matrix, Quaternion, Vector
+import numpy as np
 
-from . import native_materials
-from .blender_scene import LIGHT_POWER, convert_point
-from .native_scn import rebuild
+from . import convert, primitives
+from .model import AnimationCurve, Camera, Light, Mesh, Scene, SceneObject, Transform
 
-
-C = Matrix.Rotation(radians(90.0), 4, "X")
-C_INV = C.inverted()
-FIXED_KINDS = {"camera", "light"}
+FPS_CANDIDATES = (29.97, 30.0, 25.0, 24.0, 60.0, 59.94, 50.0, 23.976, 48.0, 120.0)
+BONE_KINDS = {"root": "IK_ROOT", "bone": "IK_JOINT", "eff": "IK_EFFECTOR"}
+CHANNEL_PROP = {"pos": "location", "rot": "rotation", "scl": "scale"}
 
 
-def _local_matrix(transform) -> Matrix:
-    quaternion = Quaternion(transform.quat)
-    if quaternion.magnitude < 1e-9:
-        quaternion = Euler(
-            tuple(radians(value) for value in transform.rot),
-            "XYZ",
-        ).to_quaternion()
-    else:
-        quaternion.normalize()
-    return Matrix.LocRotScale(
-        Vector(transform.pos),
-        quaternion,
-        Vector(transform.scl),
-    )
+def detect_frame_rate(times: list[float]) -> float:
+    """The frame rate that puts the key times (seconds) closest to whole frames (XSI 3.x used 29.97)."""
+    values = np.asarray([t for t in times if t != 0.0], dtype=np.float64)
+    if not len(values):
+        return 30.0
+    best, best_error = 30.0, float("inf")
+    for fps in FPS_CANDIDATES:
+        frames = values * fps
+        error = float(np.mean(np.abs(frames - np.round(frames))))
+        if error < best_error - 1e-6:
+            best, best_error = fps, error
+    return best
 
 
-def _blender_matrix(transform, own_fix: bool, parent_fix: bool) -> Matrix:
-    matrix = C @ _local_matrix(transform) @ C_INV
-    if parent_fix:
-        matrix = C_INV @ matrix
-    if own_fix:
-        matrix = matrix @ C
-    return matrix
+def _transform(native) -> Transform:
+    position = tuple(float(v) for v in native.pos)
+    rotation = tuple(float(v) for v in native.rot)
+    scale = tuple(float(v) for v in native.scl)
+    quaternion = tuple(float(v) for v in native.quat)
+    transform = Transform(position=position, rotation=rotation, scale=scale)
+    if np.linalg.norm(quaternion) > 1e-9:
+        from_quat = convert.quaternion_matrices(np.array([quaternion]))[0]
+        from_euler = convert.euler_matrices(np.array([rotation]))[0]
+        if np.abs(from_quat - from_euler).max() > 1e-4:
+            transform.quaternion = quaternion   # the Euler values are stale or use another order
+    return transform
 
 
-def build(context, scene, report, use_collection: bool = True):
-    collection = context.collection
-    if use_collection:
-        name = bpy.path.display_name_from_filepath(scene.path)
-        collection = bpy.data.collections.new(name)
-        context.collection.children.link(collection)
-    for selected in context.selected_objects:
-        selected.select_set(False)
-    made: dict[int, bpy.types.Object] = {}
-    objects: list[bpy.types.Object] = []
+def _camera(settings: dict | None) -> Camera:
+    settings = settings or {}
+    camera = Camera()
+    if settings.get("proj", 1) == 0:
+        camera.projection = "ORTHO"
+        camera.ortho_height = float(settings.get("orthoheight", 10.0))
+    if settings.get("fov"):
+        camera.field_of_view = float(settings["fov"])
+        camera.fov_type = "VERTICAL" if settings.get("fovtype", 1) == 0 else "HORIZONTAL"
+    camera.near = float(settings.get("near", camera.near))
+    camera.far = float(settings.get("far", camera.far))
+    if settings.get("aspect"):
+        camera.aspect = float(settings["aspect"])
+    return camera
 
-    def make(source):
-        if source.kind == "polymsh" and source.mesh is not None:
-            mesh = bpy.data.meshes.new(source.name)
-            mesh.from_pydata(
-                [convert_point(point) for point in source.mesh.points],
-                [],
-                source.mesh.polygons,
-            )
-            mesh.update()
-            obj = bpy.data.objects.new(source.name, mesh)
-            if source.ops:
-                obj["softimage_unapplied_operators"] = ", ".join(source.ops)
-            return obj
-        if source.kind == "polymsh" and source.generator is not None:
-            rebuilt = rebuild.primitive_mesh(source.generator)
+
+def _light(settings: dict | None) -> Light:
+    settings = settings or {}
+    light = Light(kind={0: "POINT", 1: "SUN", 2: "SPOT"}.get(settings.get("Type", 0), "POINT"))
+    shader = settings.get("soft_light")
+    intensity = 0.75
+    if shader:
+        light.color = (shader["red"], shader["green"], shader["blue"])
+        light.shadows = bool(shader["shadow"])
+        intensity = shader["intensity"]
+        light.spread_angle = float(shader.get("spread", 0.0))
+    light.intensity = intensity / 0.75
+    light.cone_angle = float(settings.get("LightCone", 60.0))
+    return light
+
+
+def _mesh(so, notes: list[str]) -> Mesh | None:
+    source = so.mesh
+    points = polygons = None
+    if source is not None:
+        points, polygons = source.points, source.polygons
+    elif so.generator is not None:
+        from .native_scn import rebuild
+        rebuilt = rebuild.primitive_mesh(so.generator)
+        if rebuilt is None:
+            rebuilt = primitives.generate(so.generator["type"], so.generator.get("params", {}))
             if rebuilt is not None:
-                points, polygons = rebuilt
-                mesh = bpy.data.meshes.new(source.name)
-                mesh.from_pydata(
-                    [convert_point(point) for point in points],
-                    [],
-                    polygons,
-                )
-                mesh.update()
-                obj = bpy.data.objects.new(source.name, mesh)
-                if source.generator.get("ops"):
-                    obj["softimage_unapplied_operators"] = ", ".join(
-                        source.generator["ops"]
-                    )
-                return obj
-            fallback = _fallback_primitive(source)
-            if fallback is not None:
-                fallback["softimage_live_primitive"] = source.generator["type"]
-                fallback["softimage_import_notes"] = (
-                    "Rebuilt from generator parameters; exact Softimage point order "
-                    "and stacked operators were not preserved."
-                )
-                return fallback
-            report(
-                {"WARNING"},
-                f"{source.name}: live {source.generator['type']} could not be rebuilt; "
-                "imported as an empty.",
-            )
-        if source.kind == "camera":
-            settings = source.camera or {}
-            camera = bpy.data.cameras.new(source.name)
-            if settings.get("proj", 1) == 0:
-                camera.type = "ORTHO"
-                camera.ortho_scale = settings.get("orthoheight", 10.0)
-            elif settings.get("fov"):
-                camera.sensor_fit = (
-                    "VERTICAL" if settings.get("fovtype", 1) == 0 else "HORIZONTAL"
-                )
-                if camera.sensor_fit == "VERTICAL":
-                    camera.angle_y = radians(settings["fov"])
-                else:
-                    camera.angle_x = radians(settings["fov"])
-            camera.clip_start = settings.get("near", camera.clip_start)
-            camera.clip_end = settings.get("far", camera.clip_end)
-            return bpy.data.objects.new(source.name, camera)
-        if source.kind == "light":
-            settings = source.light or {}
-            kind = {0: "POINT", 1: "SUN", 2: "SPOT"}.get(
-                settings.get("Type", 0), "POINT"
-            )
-            light = bpy.data.lights.new(source.name, kind)
-            shader = settings.get("soft_light")
-            intensity = 0.75
-            if shader:
-                light.color = (shader["red"], shader["green"], shader["blue"])
-                light.use_shadow = bool(shader["shadow"])
-                intensity = shader["intensity"]
-            light.energy = LIGHT_POWER[kind] * intensity / 0.75
-            if kind == "SPOT":
-                cone = settings.get("LightCone", 60.0)
-                light.spot_size = radians(cone)
-                if shader and cone:
-                    light.spot_blend = max(
-                        0.0, min(1.0, shader["spread"] / cone)
-                    )
-            return bpy.data.objects.new(source.name, light)
-        return bpy.data.objects.new(source.name, None)
-
-    def walk(source, parent_source):
-        obj = make(source)
-        collection.objects.link(obj)
-        if parent_source is not None:
-            obj.parent = made[id(parent_source)]
-        obj.matrix_basis = _blender_matrix(
-            source.local,
-            own_fix=source.kind in FIXED_KINDS,
-            parent_fix=(
-                parent_source is not None and parent_source.kind in FIXED_KINDS
-            ),
-        )
-        made[id(source)] = obj
-        objects.append(obj)
-        for child in source.children:
-            walk(child, source)
-
-    for root in scene.roots:
-        walk(root, None)
-    native_materials.apply(scene, made, report)
-    for obj in objects:
-        obj.select_set(True)
-    if objects:
-        context.view_layer.objects.active = objects[0]
-    return objects
+                notes.append("rebuilt from generator parameters; Softimage point order and stacked "
+                             "operators were not reproduced")
+        if rebuilt is not None:
+            points, polygons = rebuilt
+    if points is None or not polygons:
+        return None
+    sizes = np.fromiter((len(p) for p in polygons), dtype=np.int32, count=len(polygons))
+    corners = np.fromiter((i for p in polygons for i in p), dtype=np.int32, count=int(sizes.sum()))
+    mesh = Mesh(points=np.asarray(points, dtype=np.float64).reshape(-1, 3), polygon_sizes=sizes,
+                corner_vertices=corners)
+    # Materials: the object's material, then cluster materials (polygon clusters).
+    names = [so.material] if so.material else []
+    index = np.zeros(len(sizes), dtype=np.int32)
+    for cluster in getattr(so, "cluster_materials", []) or []:
+        if cluster.material not in names:
+            names.append(cluster.material)
+        slot = names.index(cluster.material)
+        members = np.asarray([i for i in cluster.polygons if 0 <= i < len(sizes)], dtype=np.int64)
+        if len(members):
+            index[members] = slot
+    mesh.material_names = names
+    mesh.face_material_index = index if names else None
+    # UV sets (frozen meshes only): a merged map first when projections only cover parts of the mesh.
+    uv_sets = list(getattr(so, "uvs", []) or [])
+    if uv_sets and source is not None:
+        from .native_scn import uvs as native_uvs
+        merged = native_uvs.merged(uv_sets)
+        if merged is not None:
+            uv_sets.insert(0, merged)
+        for uv in uv_sets:
+            if len(uv.corners) == len(corners):
+                name = uv.name
+                while name in mesh.uv_layers:
+                    name += "_"
+                mesh.uv_layers[name] = np.asarray(uv.corners, dtype=np.float64)
+    weights = getattr(so, "envelope", None)
+    if weights:
+        mesh.envelope_weights = {
+            name: (np.asarray(v, dtype=np.int64), np.asarray(w, dtype=np.float64))
+            for name, (v, w) in weights.items()
+        }
+    return mesh
 
 
-def _fallback_primitive(source):
-    import bmesh
+def _curves(so, fps: float) -> list[AnimationCurve]:
+    out = []
+    for channel, index, native in getattr(so, "animation", []) or []:
+        prop = CHANNEL_PROP.get(channel)
+        if prop is None or not native.times:
+            continue
+        frames = np.asarray(native.times, dtype=np.float64) * fps
+        values = np.asarray(native.values, dtype=np.float64)
+        modes = set(native.interpolation)
+        interpolation = "CONSTANT" if modes == {"CONSTANT"} else "LINEAR" if modes == {"LINEAR"} else "CUBIC"
+        curve = AnimationCurve(target=so.name, channel=f"{so.name}.kine.local.{channel}{'xyz'[index]}",
+                               interpolation=interpolation, frames=frames, values=values,
+                               prop=prop, index=index)
+        if interpolation == "CUBIC":
+            left = np.asarray(native.left, dtype=np.float64)
+            right = np.asarray(native.right, dtype=np.float64)
+            left[:, 0] *= fps
+            right[:, 0] *= fps
+            curve.handles_left, curve.handles_right = left, right
+        out.append(curve)
+    return out
 
-    generator = source.generator
-    kind = generator["type"]
-    params = generator["params"]
-    mesh = bpy.data.meshes.new(source.name)
-    bmesh_data = bmesh.new()
-    freed = False
-    try:
-        if kind == "cube":
-            bmesh.ops.create_cube(
-                bmesh_data,
-                size=float(params.get("length", 8.0)),
-            )
-        elif kind == "sphere":
-            bmesh.ops.create_uvsphere(
-                bmesh_data,
-                u_segments=max(3, int(params.get("subdivu", 8))),
-                v_segments=max(3, int(params.get("subdivv", 8))),
-                radius=float(params.get("radius", 4.0)),
-            )
-        elif kind == "grid":
-            u = max(1, int(params.get("subdivu", 8)))
-            v = max(1, int(params.get("subdivv", 8)))
-            bmesh.ops.create_grid(
-                bmesh_data,
-                x_segments=u + 1,
-                y_segments=v + 1,
-                size=1.0,
-            )
-            scale_x = float(params.get("ulength", 8.0)) / 2.0
-            scale_y = float(params.get("vlength", 8.0)) / 2.0
-            for vertex in bmesh_data.verts:
-                vertex.co.x *= scale_x
-                vertex.co.y *= scale_y
-        elif kind in {"cylinder", "cone"}:
-            radius = float(params.get("radius", 4.0))
-            bmesh.ops.create_cone(
-                bmesh_data,
-                cap_ends=True,
-                cap_tris=False,
-                segments=max(3, int(params.get("subdivu", 8))),
-                radius1=radius,
-                radius2=radius if kind == "cylinder" else 0.0,
-                depth=float(params.get("height", 8.0)),
-            )
-        elif kind == "disc":
-            bmesh.ops.create_circle(
-                bmesh_data,
-                cap_ends=True,
-                cap_tris=False,
-                segments=max(3, int(params.get("subdivu", 8))),
-                radius=float(params.get("outerradius", 4.0)),
-            )
-        elif kind == "icosahedron":
-            bmesh.ops.create_icosphere(
-                bmesh_data,
-                subdivisions=1,
-                radius=float(params.get("radius", 4.0)),
-            )
+
+def _global_matrix(native) -> np.ndarray:
+    """Softimage global matrix of a native object's saved global kinematic state."""
+    transform = _transform(native)
+    return convert.transform_matrix(transform.position, transform.rotation, transform.scale,
+                                    transform.rotation_order, transform.quaternion)
+
+
+def _matrix_transform(matrix: np.ndarray) -> Transform:
+    locations, quaternions, scales = convert.decompose(matrix[None])
+    return Transform(position=tuple(locations[0]), scale=tuple(scales[0]),
+                     quaternion=tuple(quaternions[0]))
+
+
+def _bind_poses(sc, converted: dict[int, SceneObject]) -> int:
+    """Base poses (armature rest) from envelope bind matrices.
+
+    Bind globals are derived top-down: a node with a bind matrix uses it; a node without one (chain roots
+    and effectors between deformers, helpers) keeps its saved local transform relative to its parent's
+    bind global; a top-level node without one uses its saved global pose. Local bind = parent bind^-1 @
+    bind."""
+    if not any(getattr(so, "bind_matrix", None) is not None for so in sc.objects):
+        return 0
+    bind_global: dict[int, np.ndarray] = {}
+    count = 0
+
+    def local_of(node: SceneObject) -> np.ndarray:
+        t = node.transform
+        return convert.transform_matrix(t.position, t.rotation, t.scale, t.rotation_order, t.quaternion)
+
+    def visit(so, parent_bind):
+        nonlocal count
+        node = converted.get(id(so))
+        if node is None:
+            return
+        own = getattr(so, "bind_matrix", None)
+        if own is not None:
+            global_bind = own
+            local = np.linalg.solve(parent_bind, own) if parent_bind is not None else own
+            if not np.allclose(local, local_of(node), atol=1e-4):
+                node.base_pose = _matrix_transform(local)
+                count += 1
+        elif parent_bind is not None:
+            global_bind = parent_bind @ local_of(node)
         else:
-            bmesh_data.free()
-            freed = True
-            bpy.data.meshes.remove(mesh)
-            return None
-        bmesh_data.to_mesh(mesh)
-    finally:
-        if not freed:
-            bmesh_data.free()
-    return bpy.data.objects.new(source.name, mesh)
+            global_bind = _global_matrix(so.glob)
+        bind_global[id(so)] = global_bind
+        for child in so.children:
+            visit(child, global_bind)
+
+    for root in sc.roots:
+        visit(root, None)
+    return count
+
+
+def to_model(sc) -> Scene:
+    """Blender-independent description of a native scene."""
+    scene = Scene(source_path=str(sc.path), format_version="native", encoding="bin", float_bits=64,
+                  name=Path(sc.path).stem)
+    scene.warnings.extend(str(w) for w in sc.warnings)
+    times = [t for so in sc.objects for _c, _i, curve in getattr(so, "animation", []) for t in curve.times]
+    fps = detect_frame_rate(times)
+    scene.frame_rate = fps
+    if times:
+        scene.frame_start = math.floor(min(times) * fps + 1e-6)
+        scene.frame_end = math.ceil(max(times) * fps - 1e-6)
+        scene.metadata["frame_rate_detected"] = fps
+    converted: dict[int, SceneObject] = {}
+
+    def convert_node(so) -> SceneObject:
+        notes: list[str] = []
+        node = SceneObject(name=so.name or "Object", transform=_transform(so.local),
+                           source_template=f"native:{so.kind}")
+        kind = so.kind
+        if kind == "polymsh":
+            node.mesh = _mesh(so, notes)
+            node.kind = "MESH" if node.mesh is not None else "EMPTY"
+            if node.mesh is None:
+                notes.append("polygon mesh not decoded")
+            ops = so.ops or (so.generator or {}).get("ops") or []
+            if ops:
+                node.properties["softimage_unapplied_operators"] = ", ".join(ops)
+        elif kind == "camera":
+            node.kind, node.camera = "CAMERA", _camera(so.camera)
+        elif kind == "light":
+            node.kind, node.light = "LIGHT", _light(so.light)
+        elif kind in BONE_KINDS:
+            node.kind, node.bone_role = "BONE", BONE_KINDS[kind]
+        elif kind == "model":
+            node.kind = "EMPTY"
+            node.properties["softimage_model"] = True
+        elif kind not in (None, "null"):
+            node.properties["softimage_kind"] = kind
+            if kind not in {"CameraRoot", "CameraInterest", "SpotRoot", "SpotInterest"}:
+                notes.append(f"{kind} imported as an empty")
+        node.visible = getattr(so, "view_visible", True)
+        node.render_visible = getattr(so, "render_visible", True)
+        if so.material:
+            node.material = so.material
+        node.animation = _curves(so, fps)
+        if so.expressions:
+            node.properties["softimage_expressions"] = "; ".join(so.expressions)[:4000]
+        if notes:
+            node.properties["softimage_import_notes"] = "; ".join(notes)
+        converted[id(so)] = node
+        for child in so.children:
+            node.children.append(convert_node(child))
+        return node
+
+    for root in sc.roots:
+        scene.objects.append(convert_node(root))
+    scene.link_parents()
+    deformers = {name.casefold() for so in sc.objects for name in (getattr(so, "envelope", None) or {})}
+    for node in scene.walk():
+        if node.name.casefold() in deformers and not node.bone_role:
+            node.bone_role = "DEFORMER"
+    moved = _bind_poses(sc, converted)
+    if moved:
+        scene.metadata["bind_pose_differs"] = moved
+    expressions = sum(len(so.expressions) for so in sc.objects)
+    if expressions:
+        scene.warnings.append(f"{expressions} expression(s) drive parameters; they are stored on the objects "
+                              "as text (softimage_expressions) and not evaluated.")
+    return scene
+
+
+def build(context, sc, report, use_collection: bool = True, options=None):
+    from . import blender_scene, native_materials
+
+    if options is None:
+        options = blender_scene.ImportOptions(use_collection=use_collection)
+    scene = to_model(sc)
+    lookup = None
+    if options.import_materials:
+        builder = native_materials.Builder(sc, report, import_textures=options.import_textures,
+                                           search=options.search_textures)
+        lookup = builder.material
+    objects = blender_scene.build(context, scene, report=report, options=options, material_lookup=lookup)
+    return objects

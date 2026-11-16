@@ -38,10 +38,14 @@ class DotXSITests(unittest.TestCase):
         assert mesh is not None
         self.assertEqual(mesh.polygons, [[0, 1, 2, 3]])
         self.assertEqual(len(mesh.corner_normals), 4)
-        self.assertEqual(mesh.uv_layers["UV0"], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+        self.assertEqual(
+            mesh.uv_layers["UV0"].tolist(), [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        )
         self.assertEqual(len(mesh.color_layers["COLOR"]), 4)
         self.assertEqual(mesh.face_materials, ["DefaultLib.Red"])
-        self.assertEqual(mesh.envelope_weights["Bone"], [(0, 1.0), (1, 0.5)])
+        vertices, weights = mesh.envelope_weights["Bone"]
+        self.assertEqual(vertices.tolist(), [0, 1])
+        self.assertEqual(weights.tolist(), [1.0, 0.5])
 
         self.assertEqual(scene.objects[1].kind, "CAMERA")
         self.assertEqual(scene.objects[2].kind, "LIGHT")

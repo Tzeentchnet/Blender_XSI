@@ -3,9 +3,9 @@
 # Adapted for the standalone Softimage importer extension.
 """Materials, UV maps and image textures for File > Import > Softimage Scene (spec io.scn-materials).
 
-`apply(sc, made, report)` runs after the objects exist: one Blender material per Softimage material that a mesh
-uses (shared like in Softimage), cluster materials in further slots, UV maps from the texture projections, and an
-Image Texture where an image feeds the main colour. Everything not carried over is named in the report and in the
+`Builder(sc, report).material(key)` creates one Blender material per Softimage material key on first use (shared
+like in Softimage), with an Image Texture where an image feeds the main colour. Slot assignment and UV maps are
+done by `native_import` / `blender_scene`. Everything not carried over is named in the report and in the
 material's `si_import_notes`.
 """
 import os
@@ -211,15 +211,22 @@ def _connected_nodes(shader, seen=None):
 
 
 class Builder:
-    def __init__(self, sc, report):
+    def __init__(self, sc, report, import_textures=True, search=True):
+        from .images import ImageResolver
         self.sc = sc
-        self.report = report
+        self.report = report or (lambda kind, msg: None)
+        self.import_textures = import_textures
+        self.resolver = ImageResolver(sc.path, search)
         self.made = {}             # material key -> bpy material
         self.tree_notes = 0        # materials with render tree nodes not converted
         self.uv_of = {}            # material key -> UV map name wanted by its image node
 
     def material(self, key):
         if key in self.made:
+            return self.made[key]
+        legacy = getattr(self.sc, "legacy_materials", {}).get(key)
+        if legacy is not None:
+            self.made[key] = self._legacy(legacy)
             return self.made[key]
         lib, _, name = key.partition(".")
         mat = bpy.data.materials.new(name or key)
@@ -235,7 +242,8 @@ class Builder:
         surf = m.ports.get("surface") if m is not None else None
         fam = family(surf.progid) if surf is not None else None
         if m is None:
-            notes.append("material not found in the scene's libraries")
+            notes.append("material not found in the scene's libraries" if self.sc.materials else
+                          "material definitions not decoded for this Softimage version")
         elif surf is None:
             notes.append("no surface shader")
         if surf is not None:
@@ -258,7 +266,8 @@ class Builder:
                 for k, v in principled_values(fam, surf.params).items():
                     _set(bsdf, k, v)
                 mat.diffuse_color = tuple(bsdf.inputs["Base Color"].default_value)
-                self._image(mat, bsdf, surf, fam, notes)
+                if self.import_textures:
+                    self._image(mat, bsdf, surf, fam, notes)
             elif surf is not None:
                 notes.append("surface shader %s not supported" % surf.progid)
                 self.report({'WARNING'}, "Material %s: surface shader %s is not supported (imported as a plain "
@@ -271,6 +280,62 @@ class Builder:
         if notes:
             mat["si_import_notes"] = "; ".join(notes)
         self.made[key] = mat
+        return mat
+
+    def _legacy(self, source):
+        """Material from an XSI 3.x shader (native_scn.materials_v3.LegacyMaterial)."""
+        mat = bpy.data.materials.new(source.name)
+        mat.use_nodes = True
+        nt = mat.node_tree
+        nt.nodes.clear()
+        out = nt.nodes.new("ShaderNodeOutputMaterial")
+        out.location = (400, 0)
+        bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+        nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
+        notes = []
+        diffuse = source.colours.get("diffuse")
+        if diffuse is not None:
+            _set(bsdf, "Base Color", diffuse[:3])
+            mat.diffuse_color = (*diffuse[:3], 1.0)
+        specular = source.colours.get("specular")
+        if specular is not None:
+            _set(bsdf, "Specular Tint", specular[:3])
+            _set(bsdf, "Specular IOR Level", min(1.0, 0.5 * max(specular[:3])))
+        if source.shader == "constant":
+            _set(bsdf, "Emission Color", (diffuse or (0.8, 0.8, 0.8, 1.0))[:3])
+            _set(bsdf, "Emission Strength", 1.0)
+        mat["si_shader"] = source.shader or "unknown"
+        if self.import_textures and source.images:
+            clip, paths = source.images[0]
+            tex = nt.nodes.new("ShaderNodeTexImage")
+            tex.location = (-400, 0)
+            tex.label = clip
+            found = None
+            for stored in paths:
+                found = self.resolver.resolve(stored)
+                if found is not None:
+                    break
+            if found is not None:
+                tex.image = bpy.data.images.load(str(found), check_existing=True)
+            else:
+                shown = paths[0] if paths else clip
+                img = bpy.data.images.new(clip or "missing", 8, 8)
+                img.source = "FILE"
+                img.filepath = shown
+                tex.image = img
+                notes.append("image file missing: %s" % shown)
+                self.report({"WARNING"}, "Material %s: image file missing: %s" % (mat.name, shown))
+            nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+            if source.projections:
+                uvn = nt.nodes.new("ShaderNodeUVMap")
+                uvn.location = (-650, 0)
+                uvn.uv_map = source.projections[0]
+                nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
+            if len(source.images) > 1:
+                notes.append("%d further image(s) not connected: %s" % (
+                    len(source.images) - 1, ", ".join(n for n, _p in source.images[1:])))
+        if notes:
+            mat["si_import_notes"] = "; ".join(notes)
         return mat
 
     def _main_link(self, surf, fam):
@@ -293,7 +358,12 @@ class Builder:
         name, paths = (None, [])
         if img_shader.clip is not None:
             name, paths = scn_materials.clip_paths(self.sc.cfb, img_shader.clip)
-        found, shown = resolve_image(paths, self.sc.path)
+        found, shown = None, (paths[0] if paths else "")
+        for stored in paths:
+            hit = self.resolver.resolve(stored)
+            if hit is not None:
+                found = shown = str(hit)
+                break
         if found:
             tex.image = bpy.data.images.load(found, check_existing=True)
         else:
@@ -308,52 +378,3 @@ class Builder:
         tspace = img_shader.params.get("tspace_id")
         uvn.uv_map = tspace if isinstance(tspace, str) else ""
         nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
-
-    def assign(self, so, ob):
-        if ob.type != 'MESH' or not so.material:
-            return
-        me = ob.data
-        keys = [so.material] + [c.material for c in so.cluster_materials]
-        slot = {}
-        for k in keys:
-            if k not in slot:
-                me.materials.append(self.material(k))
-                slot[k] = len(me.materials) - 1
-        npolys = len(me.polygons)
-        for c in so.cluster_materials:
-            for i in c.polygons:
-                if 0 <= i < npolys:
-                    me.polygons[i].material_index = slot[c.material]
-
-
-def add_uvs(so, ob):
-    """UV maps from the texture projections of a frozen mesh (corner order = Mesh.polygons order)."""
-    sets = getattr(so, "uvs", None)
-    if not sets or ob.type != 'MESH' or so.mesh is None:
-        return
-    me = ob.data
-    nloops = len(me.loops)
-    for u in sets:
-        if len(u.corners) != nloops:
-            continue
-        lay = me.uv_layers.new(name=u.name)
-        flat = [c for uv in u.corners for c in uv]
-        lay.data.foreach_set("uv", flat)
-    if me.uv_layers:
-        me.uv_layers.active_index = 0
-
-
-def apply(sc, made, report):
-    """Materials, UVs and image textures for the objects just built (made: {id(SceneObject): bpy object})."""
-    rep = report or (lambda kind, msg: None)
-    b = Builder(sc, rep)
-    for so in sc.objects:
-        ob = made.get(id(so))
-        if ob is None or so.kind != "polymsh":
-            continue
-        add_uvs(so, ob)
-        b.assign(so, ob)
-    if b.tree_notes:
-        rep({'WARNING'}, "%d material(s) have render tree nodes that were not converted (see each material's "
-                         "si_import_notes)" % b.tree_notes)
-    return b.made

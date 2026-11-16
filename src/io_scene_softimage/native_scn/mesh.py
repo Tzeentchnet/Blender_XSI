@@ -26,15 +26,18 @@ class MeshError(Exception):
 
 
 class Mesh:
-    __slots__ = ("points", "polygons", "counts", "edges_ok")
+    __slots__ = ("points", "polygons", "counts", "edges_ok", "nodes", "layout")
 
-    def __init__(self, points, polygons, counts, edges_ok=None):
+    def __init__(self, points, polygons, counts, edges_ok=None, nodes=None, layout="2015"):
         self.points = points        # [(x, y, z), ...]
         self.polygons = polygons    # [[i0, i1, ...], ...]
         self.counts = counts        # header counts: points, edges+1, polygons, nodes
         # True when the polygons give exactly the stored edge count (a cheap topology self-check);
         # False flags geometry that is probably damaged; None = not checked.
         self.edges_ok = edges_ok
+        # Polygon node indices per polygon when nodes are not numbered in polygon order (XSI 3.x).
+        self.nodes = nodes
+        self.layout = layout
 
     def __repr__(self):
         return "<Mesh %d points, %d polygons>" % (len(self.points), len(self.polygons))
@@ -165,7 +168,11 @@ def read_polymsh(d, obj):
         if indices is not None and starts is not None and points is not None:
             break
     if indices is None or points is None:
-        raise MeshError("arrays not found (points=%s indices=%s)" % (points is not None, indices is not None))
+        try:
+            return read_polymsh_v3(d, lo, hi)
+        except MeshError as legacy_error:
+            raise MeshError("arrays not found (points=%s indices=%s); XSI 3.x layout: %s" % (
+                points is not None, indices is not None, legacy_error))
     sizes = _polygon_sizes(edge_polys, npolys, nnodes)
     if sizes is None:
         if npolys and nnodes % npolys == 0:          # uniform polygons
@@ -195,6 +202,120 @@ def read_polymsh(d, obj):
     if ok is None and _nedges1:
         ok = _edge_count(polygons, npts) == _nedges1 - 1
     return Mesh(points, polygons, (npts, _nedges1, npolys, nnodes), ok)
+
+
+# ---------------------------------------------------------------- XSI 3.x layout ----------------------
+# Scenes saved by XSI 2.x - 4.x serialize the geometry sequentially with compact numbers instead of the
+# f0 f1 arrays (reverse engineered from the Half-Life 2 source scenes, XSI 3.0 - 3.51):
+#
+#   <npts> <nedges + 1> <npolys> <nnodes>          blob header (as in later versions)
+#   ...                                            vertex / edge flag runs, crease lists (not decoded)
+#   <npts> <nnodes> <x>                            node table header (preceded by `f1 <npts> <k>` and k
+#                                                  (cnum, f32) pairs, apparently vertex creases)
+#   nnodes x (<vertex cnum> <slot byte>)           node -> vertex; slot = the node's rank around its vertex
+#   <npts> <capacity> <x>                          point header
+#   3 * npts compact doubles                       point positions (records.cdouble)
+#   <npolys> <nedges + 1> ...                      edge table: (polygon cnum, side byte) pairs, not decoded
+#   <nnodes> <npolys> <k values>                   polygon list header; k varies (seen 2 - 36 values)
+#   npolys x (<size> <size node cnums>)            polygons as node indices
+#
+# Compact numbers are not always written at their shortest width (3486 can be `de d9 00`), so values are
+# searched in every width. The decode is validated by its own invariants: node vertices < npts, the point
+# header follows the node table, and the polygon list uses each node exactly once.
+
+def _cnum_variants(v):
+    out = []
+    if v < 0x10:
+        out.append(bytes([0xF0 | v]))
+    if v < 0x1000:
+        out.append(bytes([0xE0 | (v & 15), v >> 4]))
+    if v < 0x100000:
+        out.append(bytes([0xD0 | (v & 15), (v >> 4) & 255, v >> 12]))
+    out.append(bytes([0xC0 | (v & 15), (v >> 4) & 255, (v >> 12) & 255, (v >> 20) & 255]))
+    return out
+
+
+def _sequence_re(*values):
+    return re.compile(b"|".join(
+        re.escape(b"".join(combo))
+        for combo in itertools.product(*[_cnum_variants(v) for v in values])
+    ), re.S)
+
+
+def read_polymsh_v3(d, lo, hi):
+    from .records import cdouble
+    try:
+        npts, q = cnum(d, lo)
+        nedges1, q = cnum(d, q)
+        npolys, q = cnum(d, q)
+        nnodes, q = cnum(d, q)
+    except (Lost, IndexError) as e:
+        raise MeshError("bad geometry header: %s" % e)
+    if npts == 0 or npolys == 0 or nnodes == 0:
+        raise MeshError("empty mesh")
+    # node table
+    found = None
+    for m in _sequence_re(npts, nnodes).finditer(d, lo + 1, hi):
+        q = m.end()
+        try:
+            _extra, q = cnum(d, q)
+            vertex = [0] * nnodes
+            for i in range(nnodes):
+                v, q = cnum(d, q)
+                if v >= npts:
+                    raise MeshError("node vertex out of range")
+                vertex[i] = v
+                q += 1
+            n2, q = cnum(d, q)
+            if n2 != npts:
+                continue
+            found = (vertex, q)
+            break
+        except (Lost, IndexError, MeshError):
+            continue
+    if found is None:
+        raise MeshError("node table not found")
+    vertex, q = found
+    try:
+        _capacity, q = cnum(d, q)
+        _x, q = cnum(d, q)
+        flat = [0.0] * (3 * npts)
+        for i in range(3 * npts):
+            flat[i], q = cdouble(d, q)
+    except (Lost, IndexError) as e:
+        raise MeshError("points not decoded: %s" % e)
+    points = [tuple(flat[i:i + 3]) for i in range(0, len(flat), 3)]
+    points_end = q
+    # polygon list
+    for m in _sequence_re(nnodes, npolys).finditer(d, points_end, hi):
+        for skip in range(0, 48):
+            q = m.end()
+            try:
+                for _ in range(skip):
+                    _v, q = cnum(d, q)
+                polys = []
+                total = 0
+                for _ in range(npolys):
+                    k, q = cnum(d, q)
+                    if k < 3 or total + k > nnodes:
+                        raise MeshError("bad polygon size")
+                    poly = [0] * k
+                    for j in range(k):
+                        poly[j], q = cnum(d, q)
+                    total += k
+                    polys.append(poly)
+            except (Lost, IndexError, MeshError):
+                continue
+            if total != nnodes:
+                continue
+            used = [v for poly in polys for v in poly]
+            if max(used) >= nnodes or len(set(used)) != nnodes:
+                continue
+            polygons = [[vertex[n] for n in poly] for poly in polys]
+            # The 3.x edge count is only a hint: mismatches are reported as "not checked".
+            ok = True if nedges1 and _edge_count(polygons, npts) == nedges1 - 1 else None
+            return Mesh(points, polygons, (npts, nedges1, npolys, nnodes), ok, nodes=polys, layout="3.x")
+    raise MeshError("polygon list not decoded")
 
 
 def _nibble_array(d, p, hi, rng_want):

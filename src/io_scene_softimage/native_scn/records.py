@@ -231,24 +231,30 @@ def _scan_objects(d, lo, hi, parent, out, om=3, hdr=OBJ_HDR):
 def _decode_object(d, o, ref_re=REF, param_marker=1):
     # The parameter block is the first "01 <u32 size>" whose records start with a 0x48 group header.
     # Most objects put it right after the header; primitives (polymsh, ...) have a short preamble first.
+    # XSI 3.x streams number their object/reference block 04 but keep the parameter block at 01, so both
+    # the stream's derived marker and 01 are accepted.
+    # XSI 3.x texture nodes put a longer preamble (their UV projection name) before the block, so the
+    # search window is 512 bytes; references are scanned even when no parameter block is found.
+    markers = {param_marker, 1}
     p = o.body
-    lim = min(o.end, o.body + 64)
+    lim = min(o.end, o.body + 512)
+    found = False
     while p < lim:
-        if d[p] == param_marker and p + 5 < o.end and d[p + 5] == 0x48:
+        if d[p] in markers and p + 5 < o.end and d[p + 5] == 0x48:
             size = struct.unpack_from("<I", d, p + 1)[0]
             if p + 5 + size <= o.end:
+                found = True
                 break
         p += 1
-    else:
-        return
-    o.preamble = d[o.body:p]
-    size = struct.unpack_from("<I", d, p + 1)[0]
-    plist, stop, ok = read_params(d, p + 5, p + 5 + size)
-    o.plist = plist
-    o.complete = ok
-    for r in plist:
-        if r.id is not None and r.id not in o.params and r.vt is not None and r.lead & 0x04:
-            o.params[r.id] = r.value
+    if found:
+        o.preamble = d[o.body:p]
+        size = struct.unpack_from("<I", d, p + 1)[0]
+        plist, stop, ok = read_params(d, p + 5, p + 5 + size)
+        o.plist = plist
+        o.complete = ok
+        for r in plist:
+            if r.id is not None and r.id not in o.params and r.vt is not None and r.lead & 0x04:
+                o.params[r.id] = r.value
     # references that belong to this object (not to nested objects)
     # Scan only this object's own bytes (the gaps between nested objects): scanning the whole range
     # for every ancestor made large scenes quadratic.

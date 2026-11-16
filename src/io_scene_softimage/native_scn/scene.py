@@ -177,6 +177,9 @@ GENERATOR_PARAMS = {
 }
 
 P_NAME = "2b91c031-677a-11d1-b0cf-00a024c79287"
+# Visibility property: view and render visibility (off on cameras, which Softimage hides from renders).
+P_VIEW_VISIBILITY = "d636f4d0-d94b-11d1-b0ed-00a024c79287"
+P_RENDER_VISIBILITY = "a9d242e0-d948-11d1-b0ed-00a024c79287"
 
 
 def _g(prefix, *lows):
@@ -200,6 +203,11 @@ KINE_LOCAL = {
     "rot": ("06294289" + _L, "0629428a" + _L, "0629428b" + _L),           # degrees, XYZ
     "quat": ("0629428c" + _L, "0629428d" + _L, "0629428e" + _L, "0629428f" + _L),  # w x y z
     "scl": ("06294290" + _L, "06294291" + _L, "06294292" + _L),
+}
+
+
+_KINE_LOCAL_CHANNELS = {
+    guid: (key, index) for key, guids in KINE_LOCAL.items() for index, guid in enumerate(guids)
 }
 
 
@@ -237,6 +245,14 @@ class SceneObject:
         self.light = None
         self.handle = None
         self.model = None         # owning model's SceneObject (None = Scene_Root)
+        # Animated local kinematics: [(channel, component, animation.NativeCurve)], channel in pos / rot /
+        # scl / quat; expressions driving parameters (text, not evaluated).
+        self.animation = []
+        self.expressions = []
+        self.envelope = None       # {deformer name: (vertex indices, weights 0..1)} for enveloped meshes
+        self.view_visible = True
+        self.render_visible = True
+        self.bind_matrix = None    # deformers: Softimage global 4x4 matrix at bind time
 
     @property
     def full_name(self):
@@ -265,6 +281,7 @@ class Scene:
         self.roots = []
         self.warnings = []
         self._models_by_storage = {}
+        self.kine_global_owner = {}   # id(stream) -> {global kinematic state handle: SceneObject}
         storages = self._model_storages()
         for storage in storages:
             self._read_model(storage)
@@ -273,8 +290,9 @@ class Scene:
             st = records.ObjectStream(self.cfb.read(storage))
             self.models[storage] = st
             self._read_legacy_stream(storage, st, Path(path).stem)
-        from . import materials
+        from . import envelope, materials
         materials.attach(self)
+        envelope.attach(self)
 
     def _model_storages(self):
         out = []
@@ -555,6 +573,13 @@ class Scene:
                                                  "(probably damaged index data)" % so.name)
                     except mesh.MeshError as e:
                         mesh_error = e
+            elif k == "visibility":
+                for record in ref.plist:
+                    guid = st.guid(record.id) if record.id is not None else None
+                    if guid == P_VIEW_VISIBILITY and isinstance(record.value, bool):
+                        so.view_visible = record.value
+                    elif guid == P_RENDER_VISIBILITY and isinstance(record.value, bool):
+                        so.render_visible = record.value
             elif k == "kinematics":
                 for h2, _c2, _p2 in ref.refs:
                     state = st.by_handle.get(h2)
@@ -563,8 +588,10 @@ class Scene:
                     ks = self._kind(st, state)
                     if ks == "kine_local":
                         self._fill(state, so.local, ctx["kine_local"])
+                        self._read_animation(st, state, so)
                     elif ks == "kine_global":
                         self._fill(state, so.glob, ctx["kine_global"])
+                        self.kine_global_owner.setdefault(id(st), {})[h2] = so
         if so.kind in ("camera", "light") and so.primitive is not None:
             from . import camlight
             if so.kind == "camera":
@@ -577,6 +604,26 @@ class Scene:
                 so.generator = self._generator(st, so.primitive, shape)
                 if so.generator is None and mesh_error is not None:
                     self.warnings.append("%s: mesh not decoded (%s)" % (so.name, mesh_error))
+
+    def _read_animation(self, st, state, so):
+        from . import animation
+        channels = _KINE_LOCAL_CHANNELS
+        for param, target in animation.connections(st, state):
+            channel = channels.get(st.guid(param))
+            cls = st.guid(target.pbase)
+            if cls == animation.CLS_FCURVE:
+                if channel is None:
+                    continue
+                curve = animation.read_fcurve(st.data, target)
+                if curve is None:
+                    self.warnings.append("%s: an F-curve on %s could not be decoded" % (so.name, channel[0]))
+                    continue
+                so.animation = [a for a in so.animation if (a[0], a[1]) != channel]
+                so.animation.append((channel[0], channel[1], curve))
+            elif cls == animation.CLS_EXPRESSION:
+                text = animation.expression_text(st, target)
+                if text and text not in so.expressions:
+                    so.expressions.append(text)
 
     @staticmethod
     def _stack_ops(st, polymsh):

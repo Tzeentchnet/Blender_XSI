@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""XSI 3.x native layouts (geometry, F-curves, envelopes) on synthetic byte streams."""
+
+from __future__ import annotations
+
+import struct
+from types import SimpleNamespace
+import unittest
+
+import numpy as np
+
+from io_scene_softimage import native_import
+from io_scene_softimage.native_scn import animation, envelope, mesh
+
+
+def cnum(value: int, width: int | None = None) -> bytes:
+    variants = mesh._cnum_variants(value)
+    if width is None:
+        return variants[0]
+    return next(v for v in variants if len(v) == width)
+
+
+def cdouble(value: float) -> bytes:
+    if value == 0.0:
+        return b"\xff"
+    if value == 1.0:
+        return b"\xfe"
+    return b"\xfc" + struct.pack("<d", value)
+
+
+def obj(data: bytes, start: int = 0):
+    return SimpleNamespace(start=start, body=start, end=len(data))
+
+
+class LegacyGeometryTests(unittest.TestCase):
+    def _quad(self, wide: bool) -> bytes:
+        # Two triangles sharing an edge: 4 points, 5 edges, 2 polygons, 6 nodes.
+        points = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
+        node_vertex = [0, 1, 2, 0, 2, 3]
+        slots = [0, 0, 0, 1, 1, 0]
+        width = 3 if wide else None            # writers do not always use the shortest form
+        blob = cnum(4) + cnum(6) + cnum(2) + cnum(6) + b"\x21\x07\x10\x00\x00"
+        blob += b"\xf1" + cnum(4, width) + b"\xf0" + cnum(4, width) + cnum(6, width) + b"\xf0"
+        blob += b"".join(cnum(v) + bytes([s]) for v, s in zip(node_vertex, slots))
+        blob += cnum(4) + cnum(4) + cnum(64)
+        blob += b"".join(cdouble(c) for p in points for c in p)
+        blob += cnum(2) + cnum(6) + b"\xf0\xf0\x00"                        # edge table (skipped)
+        blob += cnum(6) + cnum(2) + cnum(8) + cnum(0)                       # polygon list header
+        blob += cnum(3) + cnum(0) + cnum(1) + cnum(2) + cnum(3) + cnum(3) + cnum(4) + cnum(5)
+        return blob
+
+    def test_decodes_sequential_layout(self):
+        for wide in (False, True):
+            data = self._quad(wide)
+            result = mesh.read_polymsh_v3(data, 0, len(data))
+            self.assertEqual(result.layout, "3.x")
+            self.assertEqual(result.polygons, [[0, 1, 2], [0, 2, 3]])
+            self.assertEqual(result.nodes, [[0, 1, 2], [3, 4, 5]])
+            self.assertEqual(result.points[2], (1.0, 1.0, 0.0))
+            self.assertTrue(result.edges_ok)
+
+
+class LegacyAnimationTests(unittest.TestCase):
+    def test_reads_fcurve_keys(self):
+        clamp = struct.pack("<3d", 2.5, -1.7976931348623157e308, 1.7976931348623157e308)
+        keys = struct.pack("<7dI", 0.0, 1.0, 1.0, -0.1, 1.0, 0.1, 1.0, 3)
+        keys += struct.pack("<7dI", 1.0, 5.0, 5.0, 0.9, 4.0, 1.1, 6.0, 2)
+        data = b"\x00" * 10 + b"UC1010" + b"\x00" * 6 + clamp + struct.pack("<II", 3, 2) + keys
+        curve = animation.read_fcurve(data, obj(data))
+        self.assertEqual(curve.default, 2.5)
+        self.assertEqual(curve.times, [0.0, 1.0])
+        self.assertEqual(curve.values, [1.0, 5.0])
+        self.assertEqual(curve.right[0], (0.1, 1.0))
+        self.assertEqual(curve.interpolation, ["CUBIC", "LINEAR"])
+
+    def test_detects_ntsc_frame_rate(self):
+        times = [frame / 29.97 for frame in (0, 7, 14, 22, 39)]
+        self.assertEqual(native_import.detect_frame_rate(times), 29.97)
+        self.assertEqual(native_import.detect_frame_rate([f / 30.0 for f in (3, 10, 17)]), 30.0)
+        self.assertEqual(native_import.detect_frame_rate([]), 30.0)
+
+
+class LegacyEnvelopeTests(unittest.TestCase):
+    def test_run_length_weights(self):
+        # 2 deformers x 3 points: [[100, 0, 50], [0, 100, 50]]
+        def run(skip, values):
+            return cnum((skip << 16) | len(values)) + struct.pack("<%df" % len(values), *values)
+
+        body = cnum(3) + b"\x00" * 12 + run(0, [100.0]) + run(1, [50.0]) + run(1, [100.0, 50.0])
+        matrix = envelope.decode_weights(body, obj(body), 2, 3)
+        np.testing.assert_allclose(matrix, [[100, 0, 50], [0, 100, 50]])
+
+    def test_bind_matrix(self):
+        values = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 2.0, 37.5, 0.75, 1]
+        data = b"\x05\x3c\x00\x00\x00" + b"".join(cdouble(float(v)) for v in values)
+        matrix = envelope.bind_matrix(data, obj(data))
+        np.testing.assert_allclose(matrix[:3, 3], [2.0, 37.5, 0.75])
+        np.testing.assert_allclose(matrix[3], [0, 0, 0, 1])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -405,7 +405,7 @@ def cluster_elements(st, o):
     p = o.body
     while p + 6 < o.end:
         n = struct.unpack_from("<I", d, p + 1)[0]
-        if d[p + 5] == 0 and 2 <= n <= o.end - p - 5:
+        if d[p + 5] in (0, 1) and 2 <= n <= o.end - p - 5:
             end = p + 5 + n
             for r in range(p + 6, min(end, p + 6 + 16)):
                 out = _counted(d, r, end)
@@ -498,6 +498,11 @@ def attach(sc):
             key = branch.get(id(cur))
             cur = cur.parent
         so.material = key or root_key or "DefaultLib.Scene_Material"
+    if not sc.materials:
+        # Scenes saved by XSI 2.x - 4.x keep materials and shaders in the model streams.
+        from . import materials_v3
+        if materials_v3.attach(sc):
+            sc.warnings[:] = [w for w in sc.warnings if "no shader definitions" not in str(w)]
 
 
 # ---------------------------------------------------------------- image clips ---------------------------

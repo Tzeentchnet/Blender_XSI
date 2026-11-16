@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Softimage Importer",
     "author": "Blender XSI contributors",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 2, 0),
     "location": "File > Import > Softimage",
     "description": "Import dotXSI, native Softimage scenes, and Softimage models",
