@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+from __future__ import annotations
+
+from pathlib import Path
+import tempfile
+import unittest
+
+from io_scene_softimage import dotxsi
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class DotXSITests(unittest.TestCase):
+    def test_parses_mesh_hierarchy_materials_envelopes_and_animation(self):
+        scene = dotxsi.load(FIXTURES / "basic.xsi")
+
+        self.assertEqual(scene.format_version, "0360")
+        self.assertEqual(scene.name, "Example")
+        self.assertEqual((scene.frame_start, scene.frame_end, scene.frame_rate), (1, 10, 24))
+        self.assertEqual(scene.coordinate_system, (1, 0, 1, 0, 2, 5))
+        self.assertEqual(scene.images["checker_image"], "checker.png")
+
+        material = scene.materials["DefaultLib.Red"]
+        self.assertEqual(material.diffuse, (0.8, 0.1, 0.05, 1.0))
+        self.assertEqual(material.image, "checker_image")
+
+        quad = scene.objects[0]
+        self.assertEqual(quad.name, "Quad")
+        self.assertEqual(quad.transform.position, (1.0, 2.0, 3.0))
+        self.assertEqual(quad.children[0].kind, "BONE")
+        self.assertEqual(len(quad.animation), 1)
+        self.assertEqual(quad.animation[0].keys, [(1.0, 1.0), (10.0, 5.0)])
+
+        mesh = quad.mesh
+        self.assertIsNotNone(mesh)
+        assert mesh is not None
+        self.assertEqual(mesh.polygons, [[0, 1, 2, 3]])
+        self.assertEqual(len(mesh.corner_normals), 4)
+        self.assertEqual(mesh.uv_layers["UV0"], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
+        self.assertEqual(len(mesh.color_layers["COLOR"]), 4)
+        self.assertEqual(mesh.face_materials, ["DefaultLib.Red"])
+        self.assertEqual(mesh.envelope_weights["Bone"], [(0, 1.0), (1, 0.5)])
+
+        self.assertEqual(scene.objects[1].kind, "CAMERA")
+        self.assertEqual(scene.objects[2].kind, "LIGHT")
+        self.assertEqual(scene.objects[2].light.intensity, 2.0)
+        self.assertEqual(scene.warnings, [])
+
+    def test_accepts_bom_comments_and_semicolons(self):
+        scene = dotxsi.loads(
+            "\ufeffxsi 0300txt 0064\n"
+            "# comment\n"
+            "SI_Scene Test { \"FRAMES\"; 0; 1; 30; }\n"
+        )
+        self.assertEqual(scene.float_bits, 64)
+        self.assertEqual(scene.frame_rate, 30)
+
+    def test_rejects_binary_dotxsi_with_actionable_error(self):
+        with self.assertRaisesRegex(dotxsi.DotXSIError, "Re-export.*ASCII"):
+            dotxsi.loads("xsi 0360bin 0032\n")
+
+    def test_rejects_truncated_polygon_data(self):
+        text = (
+            "xsi 0360txt 0032\n"
+            "SI_Model MDL-Bad {\n"
+            " SI_Mesh MSH-Bad {\n"
+            "  SI_Shape SHP-Bad { 1; \"ORDERED\"; 3; \"POSITION\";"
+            " 0;0;0; 1;0;0; 0;1;0; }\n"
+            "  SI_PolygonList Bad { 1; \"\"; \"\"; 3; 3; 0; 1; }\n"
+            " }\n"
+            "}\n"
+        )
+        with self.assertRaisesRegex(dotxsi.DotXSIError, "truncated"):
+            dotxsi.loads(text)
+
+    def test_reads_crosswalk_transform_and_camera_templates(self):
+        transform_values = [
+            1, 2, 3,
+            10, 20, 30,
+            5,
+            2, 3, 4,
+            1,
+        ] + [0] * 21 + [0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0]
+        self.assertEqual(len(transform_values), 44)
+        body = ";".join(str(value) for value in transform_values)
+        scene = dotxsi.loads(
+            "xsi 0500txt 0032\n"
+            f"XSI_Model Model {{ XSI_Transform Transform {{ {body}; }} }}\n"
+            "XSI_Camera Camera { 0; 1.777777; 45; 1; 1; 10; 5; 0.25; 500; "
+            "0; 1.4; 0.8; 0; 0; }\n"
+        )
+        model, camera = scene.objects
+        self.assertEqual(model.transform.position, (1.0, 2.0, 3.0))
+        self.assertEqual(model.transform.rotation, (10.0, 20.0, 30.0))
+        self.assertEqual(model.transform.rotation_order, "ZYX")
+        self.assertEqual(model.transform.scale, (2.0, 3.0, 4.0))
+        self.assertEqual(camera.camera.projection, "PERSP")
+        self.assertEqual(camera.camera.field_of_view, 45.0)
+        self.assertEqual(camera.camera.near, 0.25)
+        self.assertEqual(camera.camera.far, 500.0)
+
+    def test_read_header_identifies_native_scene(self):
+        with tempfile.NamedTemporaryFile(suffix=".xsi") as stream:
+            stream.write(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+            stream.flush()
+            with self.assertRaisesRegex(dotxsi.DotXSIError, "native Softimage"):
+                dotxsi.read_header(stream.name)
+
+
+if __name__ == "__main__":
+    unittest.main()

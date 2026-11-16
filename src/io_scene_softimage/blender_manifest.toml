@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "io_scene_softimage"
+version = "0.1.0"
+name = "Softimage Importer"
+tagline = "Import dotXSI and native Autodesk Softimage files"
+maintainer = "Blender XSI contributors"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2026 Blender XSI contributors",
+  "2026 Alex Doss",
+]
+
+tags = ["Import-Export"]
+
+[permissions]
+files = "Import Softimage files and load their referenced image textures"

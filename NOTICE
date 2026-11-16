@@ -1,0 +1,18 @@
+Softimage Importer
+==================
+
+The native Softimage .scn/.emdl reader and native material adapter contain
+code from Silica by Alex Doss:
+
+    https://github.com/whoisit/silica
+    Copyright (C) 2026 Alex Doss
+    Licensed under GPL-3.0-or-later
+
+Those files retain their original SPDX and copyright notices. The Blender
+adapter in this project is separate and does not include Silica's user
+interface, keymap, theme, or workflow code.
+
+The original dotXSI parser was informed by Autodesk's published Softimage and
+Crosswalk SDK template definitions and was tested against public dotXSI files.
+The Apache-2.0 TTO Softimage XSI Importer was reviewed as prior art; no source
+code from it is included here.

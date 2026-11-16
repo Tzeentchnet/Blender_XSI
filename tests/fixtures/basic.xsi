@@ -1,0 +1,161 @@
+xsi 0360txt 0032
+
+// Minimal, original fixture covering hierarchy and corner-domain mesh data.
+SI_FileInfo {
+    "Example Project";
+    "Test Author";
+    "2026-01-01";
+    "Softimage";
+}
+
+SI_Scene Example {
+    "FRAMES";
+    1;
+    10;
+    24;
+}
+
+SI_CoordinateSystem {
+    1; 0; 1; 0; 2; 5;
+}
+
+SI_MaterialLibrary MATLIB-Example {
+    1;
+    XSI_Material DefaultLib.Red {
+        XSI_Shader Phong {
+            "Softimage.material-phong.1.0";
+            "diffuse.red"; "FLOAT"; 0.8;
+            "diffuse.green"; "FLOAT"; 0.1;
+            "diffuse.blue"; "FLOAT"; 0.05;
+            "diffuse.alpha"; "FLOAT"; 1.0;
+            "specular.red"; "FLOAT"; 1.0;
+            "specular.green"; "FLOAT"; 1.0;
+            "specular.blue"; "FLOAT"; 1.0;
+            "shiny"; "FLOAT"; 32.0;
+        }
+        XSI_Shader Image {
+            "Softimage.txt2d-image-explicit.1.0";
+            "tex"; "checker_image"; "IMAGE";
+        }
+    }
+}
+
+SI_Model MDL-Quad {
+    SI_GlobalMaterial {
+        "DefaultLib.Red";
+        "BRANCH";
+    }
+    SI_Transform SRT-Quad {
+        1; 1; 1;
+        0; 0; 0;
+        1; 2; 3;
+    }
+    SI_Visibility { 1; }
+    SI_Mesh MSH-Quad {
+        SI_Shape SHP-Quad-ORG {
+            4;
+            "ORDERED";
+            4;
+            "POSITION";
+            -1; 0; -1;
+             1; 0; -1;
+             1; 0;  1;
+            -1; 0;  1;
+            4;
+            "NORMAL";
+            0; 1; 0;
+            0; 1; 0;
+            0; 1; 0;
+            0; 1; 0;
+            4;
+            "COLOR";
+            1; 0; 0; 1;
+            0; 1; 0; 1;
+            0; 0; 1; 1;
+            1; 1; 1; 1;
+            4;
+            "TEX_COORD_UV0";
+            "Texture_Projection";
+            0; 0;
+            1; 0;
+            1; 1;
+            0; 1;
+        }
+        SI_PolygonList QuadPolygon {
+            1;
+            "NORMAL|COLOR|TEX_COORD_UV0";
+            "DefaultLib.Red";
+            4;
+            4;
+            0; 1; 2; 3;
+            0; 1; 2; 3;
+            0; 1; 2; 3;
+            0; 1; 2; 3;
+        }
+    }
+    SI_FCurve {
+        "MDL-Quad";
+        "TRANSLATION-X";
+        "LINEAR";
+        1;
+        2;
+        2;
+        1; 1;
+        10; 5;
+    }
+    SI_Model MDL-Bone {
+        SI_Transform SRT-Bone {
+            1; 1; 1;
+            0; 0; 0;
+            0; 1; 0;
+        }
+        SI_IK_Joint BoneJoint {
+            0; 2;
+            0; 0; 0;
+            0;
+            -180; -180; -180;
+            180; 180; 180;
+            0; 0; 0;
+        }
+    }
+}
+
+SI_EnvelopeList {
+    1;
+    SI_Envelope QuadEnvelope {
+        "MDL-Quad";
+        "MDL-Bone";
+        2;
+        0; 100;
+        1; 50;
+    }
+}
+
+SI_Camera Camera {
+    0; 2; 10;
+    0; 0; 0;
+    0;
+    50;
+    0.1;
+    1000;
+}
+
+SI_Light Key {
+    2;
+    1; 0.8; 0.6;
+    4; 6; 8;
+    0; 0; 0;
+    45;
+    5;
+    SI_LightInfo {
+        0; 1; 0; 100; 1; 0; 0; 1; 2;
+    }
+}
+
+XSI_ImageLibrary {
+    1;
+    XSI_Image checker_image {
+        "checker.png";
+        2; 2; 4; 32;
+    }
+}
