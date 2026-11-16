@@ -209,7 +209,7 @@ def _make_object(
             for vertex, weight in weights:
                 group.add([vertex], weight, "REPLACE")
     if source.kind == "BONE":
-        obj.empty_display_type = "OCTAHEDRAL"
+        obj.empty_display_type = "SINGLE_ARROW"
         obj.empty_display_size = source.bone_length or 1.0
         obj["softimage_bone"] = True
     return obj

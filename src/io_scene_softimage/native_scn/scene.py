@@ -6,6 +6,8 @@ Classes and parameters are identified by GUID (stable across files); the per-fil
 indices into the stream's GUID table. The GUIDs below were identified from scenes generated for this
 purpose (tools/sicapture/softimage/gen_scn_corpus.py) by comparing them with Softimage's own answers.
 """
+from pathlib import Path
+
 from . import cfb, records
 
 # Class kinds, keyed by the GUID of the class's root parameter definition (Obj.pbase).
@@ -263,8 +265,14 @@ class Scene:
         self.roots = []
         self.warnings = []
         self._models_by_storage = {}
-        for storage in self._model_storages():
+        storages = self._model_storages()
+        for storage in storages:
             self._read_model(storage)
+        if not storages and self.cfb.exists("Contents"):
+            storage = "Contents"
+            st = records.ObjectStream(self.cfb.read(storage))
+            self.models[storage] = st
+            self._read_legacy_stream(storage, st, Path(path).stem)
         from . import materials
         materials.attach(self)
 
@@ -280,6 +288,14 @@ class Scene:
         guids = records.guid_table(self.cfb.read(storage + "/GUIDS")) if self.cfb.exists(storage + "/GUIDS") else {}
         st = records.ObjectStream(data, guids)
         self.models[storage] = st
+        if not guids:
+            model_name = (
+                storage.rsplit("/", 1)[-1]
+                if "/Scene.Models/" in storage
+                else None
+            )
+            self._read_legacy_stream(storage, st, model_name)
+            return
         inv = {g: i for i, g in guids.items()}
         ctx = {
             "st": st,
@@ -320,6 +336,170 @@ class Scene:
             self.objects.append(so)
             if so.parent is None:
                 self.roots.append(so)
+
+    def _read_legacy_stream(self, storage, st, model_name):
+        wrappers = []
+        states = {}
+        for obj in st.objects:
+            name = obj.params.get(3)
+            if not isinstance(name, str) or not name:
+                continue
+            state = self._legacy_local_state(st, obj)
+            if state is not None:
+                wrappers.append(obj)
+                states[obj.handle] = state
+
+        model = None
+        if model_name is not None:
+            model = SceneObject(model_name)
+            model.kind = "model"
+            self.objects.append(model)
+            self.roots.append(model)
+            self._models_by_storage[storage] = model
+
+        made = {}
+        for obj in wrappers:
+            so = SceneObject(obj.params[3])
+            so.handle = obj.handle
+            so.body = (st, obj)
+            self._fill_legacy_transform(states[obj.handle], so.local)
+            self._fill_legacy_kind(st, obj, so)
+            made[obj.handle] = so
+            self.objects.append(so)
+
+        for obj in wrappers:
+            so = made[obj.handle]
+            if model is not None:
+                so.model = model
+            parent = obj.parent
+            while parent is not None and parent.handle not in made:
+                parent = parent.parent
+            if parent is not None:
+                so.parent = made[parent.handle]
+                so.parent.children.append(so)
+            elif model is not None:
+                so.parent = model
+                model.children.append(so)
+            else:
+                self.roots.append(so)
+
+        if wrappers:
+            self.warnings.append(
+                f"{Path(self.path).name}: imported a legacy native object stream; "
+                "unsupported object types are represented as empties"
+            )
+        else:
+            self.warnings.append(
+                f"{Path(self.path).name}: no supported objects were decoded from "
+                "the legacy native object stream"
+            )
+
+    @classmethod
+    def _legacy_local_state(cls, st, root):
+        for obj in cls._legacy_graph(st, root):
+            values = list(obj.params.values())
+            if (
+                len(values) == 17
+                and all(type(value) in (int, float) for value in values[:16])
+            ):
+                return obj
+        return None
+
+    @staticmethod
+    def _legacy_graph(st, root):
+        queue = [root]
+        seen = set()
+        while queue:
+            obj = queue.pop(0)
+            if obj.handle in seen:
+                continue
+            seen.add(obj.handle)
+            if obj is not root and isinstance(obj.params.get(3), str):
+                continue
+            yield obj
+            queue.extend(obj.children)
+            queue.extend(
+                ref
+                for handle, _cls, _pos in obj.refs
+                if (ref := st.by_handle.get(handle)) is not None
+            )
+
+    @staticmethod
+    def _fill_legacy_transform(state, transform):
+        values = list(state.params.values())
+        transform.pos = [float(value) for value in values[0:3]]
+        transform.rot = [float(value) for value in values[3:6]]
+        transform.quat = [float(value) for value in values[6:10]]
+        transform.scl = [float(value) for value in values[10:13]]
+
+    def _fill_legacy_kind(self, st, root, so):
+        candidates = []
+        for obj in self._legacy_graph(st, root):
+            kind = st.kind(obj)
+            if kind is not None:
+                candidates.append((kind, obj))
+        priority = (
+            "camera",
+            "light",
+            "polymsh",
+            "CameraRoot",
+            "CameraInterest",
+            "SpotRoot",
+            "SpotInterest",
+            "null",
+            "root",
+            "bone",
+            "eff",
+            *IMPLICIT,
+        )
+        selected = next(
+            (
+                (kind, obj)
+                for wanted in priority
+                for kind, obj in candidates
+                if kind == wanted
+            ),
+            None,
+        )
+        implicit = self._legacy_implicit_kind(so.name)
+        if selected is None:
+            if implicit is not None:
+                so.kind = "polymsh"
+                so.generator = {"type": implicit, "params": {}, "ops": []}
+            return
+        kind, primitive = selected
+        so.primitive = primitive
+        if kind in IMPLICIT:
+            so.kind = "polymsh"
+            so.generator = {"type": kind, "params": {}, "ops": []}
+            return
+        so.kind = kind
+        if kind == "polymsh":
+            from . import mesh
+            try:
+                so.mesh = mesh.read_polymsh(st.data, primitive)
+            except mesh.MeshError as error:
+                if implicit is not None:
+                    so.generator = {"type": implicit, "params": {}, "ops": []}
+                else:
+                    self.warnings.append(
+                        f"{so.name}: legacy mesh not decoded ({error})"
+                    )
+        elif kind in ("camera", "light"):
+            from . import camlight
+            if kind == "camera":
+                so.camera = camlight.read_camera(st, primitive)
+            else:
+                so.light = camlight.read_light(st, primitive)
+
+    @staticmethod
+    def _legacy_implicit_kind(name):
+        normalized = name.casefold()
+        for kind in ("cube", "sphere", "grid", "cylinder", "cone", "disc"):
+            suffix = normalized.removeprefix(kind)
+            if suffix != normalized and (not suffix or suffix.isdigit()):
+                return kind
+        return None
 
     def _model_object(self, storage, st, ctx, made):
         """Models other than Scene_Root live in their own storage (.../Scene.Models/InternalModelN). The

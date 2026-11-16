@@ -575,6 +575,8 @@ def _read_mesh(scene: Scene, element: Element) -> Mesh:
     polygon_lists = element.children_of("SI_PolygonList", "XSI_PolygonList")
     for polygon_list in polygon_lists:
         _append_polygon_list(scene, mesh, layers, polygon_list)
+    for triangle_list in element.children_of("SI_TriangleList"):
+        _append_triangle_list(scene, mesh, layers, triangle_list)
     if not mesh.points:
         scene.warnings.append(
             f"{_clean_name(element.name) or 'Mesh'}: no POSITION array was decoded."
@@ -724,10 +726,59 @@ def _append_polygon_list(
         mesh.polygons.append(polygon)
         mesh.face_materials.append(material)
         start += size
+    _append_corner_data(scene, mesh, layers, element, information, cursor, corners)
+
+
+def _append_triangle_list(
+    scene: Scene,
+    mesh: Mesh,
+    layers: dict[str, list[tuple[float, ...]]],
+    element: Element,
+) -> None:
+    values = element.values
+    if len(values) < 3:
+        raise DotXSIError(
+            f"SI_TriangleList at line {element.line} has fewer than three header values."
+        )
+    triangle_count = _int(values[0], element, "triangle count")
+    information = str(values[1])
+    material = str(values[2])
+    corners = triangle_count * 3
+    cursor = 3
+    if cursor + corners > len(values):
+        raise DotXSIError(
+            f"Triangle list at line {element.line} is truncated."
+        )
+    point_indices = [
+        _int(value, element, "point index")
+        for value in values[cursor : cursor + corners]
+    ]
+    cursor += corners
+    if any(index < 0 or index >= len(mesh.points) for index in point_indices):
+        raise DotXSIError(
+            f"Triangle list at line {element.line} references a point outside "
+            f"0..{max(len(mesh.points) - 1, 0)}."
+        )
+    for start in range(0, corners, 3):
+        mesh.polygons.append(point_indices[start : start + 3])
+        mesh.face_materials.append(material)
+    _append_corner_data(scene, mesh, layers, element, information, cursor, corners)
+
+
+def _append_corner_data(
+    scene: Scene,
+    mesh: Mesh,
+    layers: dict[str, list[tuple[float, ...]]],
+    element: Element,
+    information: str,
+    cursor: int,
+    corners: int,
+) -> None:
+    values = element.values
     for semantic in filter(None, information.split("|")):
         if cursor + corners > len(values):
             scene.warnings.append(
-                f"{element.name or 'PolygonList'}: missing {semantic} corner indices."
+                f"{element.name or element.template}: missing {semantic} corner indices."
             )
             break
         indices = [
@@ -738,7 +789,7 @@ def _append_polygon_list(
         source = layers.get(semantic.upper())
         if not source or any(index < 0 or index >= len(source) for index in indices):
             scene.warnings.append(
-                f"{element.name or 'PolygonList'}: {semantic} indices could not be resolved."
+                f"{element.name or element.template}: {semantic} indices could not be resolved."
             )
             continue
         corners_data = [source[index] for index in indices]

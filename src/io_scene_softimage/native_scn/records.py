@@ -168,7 +168,7 @@ def _obj_re(om):
 
 
 REF = _ref_re(3)
-CLASSDEF = re.compile(rb"\x05\x00\x01\x00POT 1010", re.S)  # the "TOP " tag is stored byte-reversed
+CLASSDEF = re.compile(rb"\x05\x00\x01\x00POT [0-9]010", re.S)  # the "TOP " tag is stored byte-reversed
 
 
 class Obj:
@@ -228,13 +228,13 @@ def _scan_objects(d, lo, hi, parent, out, om=3, hdr=OBJ_HDR):
     return out
 
 
-def _decode_object(d, o, ref_re=REF):
+def _decode_object(d, o, ref_re=REF, param_marker=1):
     # The parameter block is the first "01 <u32 size>" whose records start with a 0x48 group header.
     # Most objects put it right after the header; primitives (polymsh, ...) have a short preamble first.
     p = o.body
     lim = min(o.end, o.body + 64)
     while p < lim:
-        if d[p] == 1 and p + 5 < o.end and d[p + 5] == 0x48:
+        if d[p] == param_marker and p + 5 < o.end and d[p + 5] == 0x48:
             size = struct.unpack_from("<I", d, p + 1)[0]
             if p + 5 + size <= o.end:
                 break
@@ -280,8 +280,9 @@ def read_ref(d, p):
 
 def read_classdefs(d, refs_by_pos):
     """class id -> (internal name, display name, description, clsid). The class id is taken from the
-    reference right before the definition."""
-    out = {}
+    reference before the definition. Older streams serialize the full inheritance chain after one
+    reference, with the concrete class immediately before the generic #3dobject base."""
+    groups = {}
     positions = sorted(refs_by_pos)
     import bisect
     for m in CLASSDEF.finditer(d):
@@ -298,10 +299,16 @@ def read_classdefs(d, refs_by_pos):
         except (struct.error, UnicodeDecodeError):
             continue
         i = bisect.bisect_left(positions, m.start()) - 1
-        if i >= 0 and m.start() - positions[i] <= 16:
+        if i >= 0:
             cls = refs_by_pos[positions[i]]
-            out[cls] = (names[0], names[1], names[2], clsid)
-    return out
+            groups.setdefault(cls, []).append((names[0], names[1], names[2], clsid))
+    return {
+        cls: next(
+            (definition for definition in reversed(definitions) if not definition[0].startswith("#")),
+            definitions[-1],
+        )
+        for cls, definitions in groups.items()
+    }
 
 
 _FIRST_LIST = re.compile(rb"([\x01-\x20]).{4}\xb0.{4}([\x01-\x20]).{4}\x03", re.S)
@@ -319,6 +326,23 @@ def detect_markers(d):
         osize = struct.unpack_from("<I", d, p + 11)[0]
         if p + 5 + lsize <= len(d) and 0 < osize < lsize and _object_at(d, p + 10, p + 5 + lsize, m.group(2)[0]):
             return {"list": m.group(1)[0], "object": m.group(2)[0]}
+    for om in range(3, 16):
+        hdr = _obj_re(om)
+        p = 12
+        found = 0
+        while found < 2:
+            m = hdr.search(d, p)
+            if m is None:
+                break
+            p = m.start()
+            o = _object_at(d, p, len(d), om)
+            if o is None:
+                p += 1
+                continue
+            found += 1
+            p = o.end
+        if found == 2:
+            return {"list": max(1, om - 1), "object": om}
     return {"list": 2, "object": 3}
 
 
@@ -355,13 +379,16 @@ class ObjectStream:
         self.objects = _scan_objects(data, 12, len(data), None, [], om, _obj_re(om))
         ref_re = _ref_re(om)
         for o in self.objects:
-            _decode_object(data, o, ref_re)
+            _decode_object(data, o, ref_re, max(1, om - 2))
         self.by_handle = {o.handle: o for o in self.objects}
         refs_by_pos = {}
         for o in self.objects:
             for h, cls, pos in o.refs:
                 refs_by_pos[pos] = cls
         self.classdefs = read_classdefs(data, refs_by_pos)
+        self.class_kinds = {
+            cls: definition[0] for cls, definition in self.classdefs.items()
+        }
         # The header's "class" field is a per-instance index; the class itself is identified by pbase
         # (the definition id of the class's root parameter). Name each pbase from any instance whose
         # class definition we saw.
@@ -376,4 +403,6 @@ class ObjectStream:
 
     def kind(self, o):
         """Class name of an object ('null', 'polymsh', 'kine', '#3dobject', ...) or None."""
+        if not self.guids:
+            return self.class_kinds.get(o.cls)
         return self.kinds.get(o.pbase)

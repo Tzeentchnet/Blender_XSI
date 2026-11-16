@@ -75,6 +75,26 @@ class DotXSITests(unittest.TestCase):
         with self.assertRaisesRegex(dotxsi.DotXSIError, "truncated"):
             dotxsi.loads(text)
 
+    def test_reads_triangle_lists(self):
+        scene = dotxsi.loads(
+            "xsi 0300txt 0032\n"
+            "SI_Model MDL-Triangles {\n"
+            " SI_Mesh MSH-Triangles {\n"
+            "  SI_Shape SHP-Triangles { 2; \"ORDERED\";"
+            "   4; \"POSITION\"; 0;0;0; 1;0;0; 1;1;0; 0;1;0;"
+            "   6; \"NORMAL\"; 0;0;1; 0;0;1; 0;0;1; 0;0;1; 0;0;1; 0;0;1; }\n"
+            "  SI_TriangleList Triangles { 2; \"NORMAL\"; \"Material\";"
+            "   0;1;2; 0;2;3; 0;1;2;3;4;5; }\n"
+            " }\n"
+            "}\n"
+        )
+        mesh = scene.objects[0].mesh
+        self.assertIsNotNone(mesh)
+        assert mesh is not None
+        self.assertEqual(mesh.polygons, [[0, 1, 2], [0, 2, 3]])
+        self.assertEqual(mesh.face_materials, ["Material", "Material"])
+        self.assertEqual(len(mesh.corner_normals), 6)
+
     def test_reads_crosswalk_transform_and_camera_templates(self):
         transform_values = [
             1, 2, 3,
@@ -102,11 +122,11 @@ class DotXSITests(unittest.TestCase):
         self.assertEqual(camera.camera.far, 500.0)
 
     def test_read_header_identifies_native_scene(self):
-        with tempfile.NamedTemporaryFile(suffix=".xsi") as stream:
-            stream.write(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
-            stream.flush()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.xsi"
+            path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
             with self.assertRaisesRegex(dotxsi.DotXSIError, "native Softimage"):
-                dotxsi.read_header(stream.name)
+                dotxsi.read_header(path)
 
 
 if __name__ == "__main__":

@@ -241,14 +241,14 @@ def _connections(ctx, q, end):
 
 
 def read(cf):
-    """Materials of an open .scn (cfb.CompoundFile): {"<Library>.<Name>": Material}, plus {handle: Shader}."""
+    """Materials and warnings from an open native Softimage compound file."""
+    warnings = []
     if not cf.exists("TLShell/Sources"):
-        return {}, {}
+        return {}, {}, warnings
     d = cf.read("TLShell/Sources")
     guids = records.guid_table(cf.read("TLShell/Sources_GUIDS")) if cf.exists("TLShell/Sources_GUIDS") else {}
     names = definition_names(cf.read("TLShell/Shader Definitions")) if cf.exists("TLShell/Shader Definitions") else {}
     ctx = _Ctx(d, guids, names)
-    warnings = []
     if not names:
         warnings.append("materials: this scene has no shader definitions (saved by an old Softimage version); "
                         "shaders are not identified")
@@ -332,8 +332,7 @@ def read(cf):
                 m.ports[port] = shaders[h]
         del m._conns
         out.setdefault(m.key, m)
-    read.warnings = warnings
-    return out, shaders
+    return out, shaders, warnings
 
 
 # ---------------------------------------------------------------- assignment ----------------------------
@@ -449,8 +448,8 @@ def _cluster_materials(st, polymsh):
 def attach(sc):
     """Fill sc.materials / sc.shaders and every object's `material` (own, inherited, or the scene default) and
     `cluster_materials`."""
-    sc.materials, sc.shaders = read(sc.cfb)
-    sc.warnings.extend(read.warnings)
+    sc.materials, sc.shaders, warnings = read(sc.cfb)
+    sc.warnings.extend(warnings)
     # A model's own material (Scene_Root's is the scene default) is the proxy no object in its stream refers to;
     # the model's objects inherit it.
     root_key = None

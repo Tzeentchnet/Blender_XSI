@@ -33,7 +33,7 @@ template nesting, n-gons, and large files.
 | dotXSI 5.0/6.0 transforms, base poses, cameras | Recognized |
 | Binary dotXSI | Not supported; the importer asks for an ASCII re-export |
 | Hierarchy and local SRT transforms | Supported |
-| Polygon meshes and n-gons | Supported |
+| Polygon meshes and n-gons | `SI_PolygonList`, `XSI_PolygonList`, and legacy `SI_TriangleList` supported |
 | Split normals, multiple UV/color sets | Supported |
 | Polygon-list material assignments | Supported |
 | Phong/Lambert-style material values and image textures | Best-effort |
@@ -58,6 +58,9 @@ dependency-free reader currently handles:
 - a subset of live polygon primitives
 - cameras and lights
 - materials, polygon-cluster assignments, UV maps, and image textures
+- legacy embedded-definition streams used by early `.scn` and `.emdl` files;
+  recoverable hierarchy, transforms, and unambiguous primitives are imported,
+  while unsupported object types are reported and represented as empties
 
 Native scene animation, envelopes, Mixer data, ICE behavior, and most live
 modeling operators are preserved only as warnings or import notes.
