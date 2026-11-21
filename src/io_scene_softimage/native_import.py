@@ -227,7 +227,9 @@ def to_model(sc) -> Scene:
 
     def convert_node(so) -> SceneObject:
         notes: list[str] = []
-        node = SceneObject(name=so.name or "Object", transform=_transform(so.local),
+        mesh_bind = getattr(so, "mesh_bind_matrix", None)
+        transform = _matrix_transform(mesh_bind) if mesh_bind is not None else _transform(so.local)
+        node = SceneObject(name=so.name or "Object", transform=transform,
                            source_template=f"native:{so.kind}")
         kind = so.kind
         if kind == "polymsh":

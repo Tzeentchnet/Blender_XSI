@@ -15,10 +15,11 @@ Only frozen geometry is stored like this; it is what Softimage keeps for every p
 """
 import collections
 import itertools
+import math
 import re
 import struct
 
-from .records import Lost, cnum
+from .records import Lost, cdouble, cnum
 
 
 class MeshError(Exception):
@@ -47,6 +48,8 @@ _ARR = re.compile(rb"\xf0\xf1", re.S)
 
 
 _BLOB = re.compile(rb"\x01[\x02-\x3f].{4}[\x02-\x3f]", re.S)
+_BMSH_TAG = b"HSMB0010"
+_MSHI_TAG = b"IHSM2010"
 
 
 def _blob(d, obj):
@@ -122,7 +125,13 @@ def _double_array(d, p, end, elem):
 
 
 def read_polymsh(d, obj):
-    lo, hi = _blob(d, obj)
+    try:
+        lo, hi = _blob(d, obj)
+    except MeshError as blob_error:
+        try:
+            return read_polymsh_bmsh(d, obj)
+        except MeshError as bmsh_error:
+            raise MeshError("%s; BMSH layout: %s" % (blob_error, bmsh_error))
     try:
         npts, q = cnum(d, lo)
         _nedges1, q = cnum(d, q)
@@ -202,6 +211,125 @@ def read_polymsh(d, obj):
     if ok is None and _nedges1:
         ok = _edge_count(polygons, npts) == _nedges1 - 1
     return Mesh(points, polygons, (npts, _nedges1, npolys, nnodes), ok)
+
+
+# ---------------------------------------------------------------- XSI 1.x BMSH layout -----------------
+# Models saved by early Softimage XSI releases keep frozen geometry in a BMSH0010 / CMSH2010 chunk.
+# The four topology tables use compact signed as well as unsigned integers. A polygon node stores its
+# vertex, an oriented edge id, and a reverse node id; the edge and polygon tables that follow the point
+# array make the topology self-validating.
+
+def _legacy_num(d, p, end):
+    """Early-stream compact integer, including the signed A/9/8/7 width tags."""
+    if p >= end:
+        raise Lost("compact int past end")
+    high = d[p] >> 4
+    if high in (0xF, 0xE, 0xD, 0xC):
+        width, signed = 0xF - high, False
+    elif high in (0xA, 0x9, 0x8, 0x7):
+        width, signed = 0xA - high, True
+    else:
+        raise Lost("compact int tag %02x at %d" % (d[p], p))
+    if p + width >= end:
+        raise Lost("truncated compact int at %d" % p)
+    value = d[p] & 0xF
+    for i in range(width):
+        value |= d[p + 1 + i] << (4 + 8 * i)
+    bits = 4 + 8 * width
+    if signed and value & (1 << (bits - 1)):
+        value -= 1 << bits
+    return value, p + 1 + width
+
+
+def _legacy_nums(d, p, end, count):
+    values = []
+    for _ in range(count):
+        value, p = _legacy_num(d, p, end)
+        values.append(value)
+    return values, p
+
+
+def read_polymsh_bmsh(d, obj):
+    """Decode an early BMSH0010 frozen polygon mesh."""
+    tag = d.find(_BMSH_TAG, obj.body, obj.end)
+    if tag < 0 or tag + 12 > obj.end:
+        raise MeshError("no BMSH0010 chunk")
+    bmsh_end = tag + 12 + struct.unpack_from("<I", d, tag + 8)[0]
+    if bmsh_end > obj.end:
+        raise MeshError("truncated BMSH0010 chunk")
+    info = d.find(_MSHI_TAG, tag + 12, bmsh_end)
+    if info < 0 or info + 12 > bmsh_end:
+        raise MeshError("no MSHI2010 table")
+    p = info + 12 + struct.unpack_from("<I", d, info + 8)[0]
+    if p > bmsh_end:
+        raise MeshError("truncated MSHI2010 table")
+
+    try:
+        (nnodes, node_capacity, _node_stride), p = _legacy_nums(d, p, bmsh_end, 3)
+        if nnodes < 3 or node_capacity < nnodes or nnodes > (bmsh_end - p) // 3:
+            raise MeshError("bad polygon-node header")
+        node_vertex = [0] * nnodes
+        node_edge = [0] * nnodes
+        node_ids = [0] * nnodes
+        for i in range(nnodes):
+            (node_vertex[i], node_edge[i], node_ids[i]), p = _legacy_nums(d, p, bmsh_end, 3)
+        if set(node_ids) != set(range(nnodes)):
+            raise MeshError("polygon-node ids are not a permutation")
+
+        (npts, point_capacity, _point_stride), p = _legacy_nums(d, p, bmsh_end, 3)
+        if npts < 3 or point_capacity < npts or any(v < 0 or v >= npts for v in node_vertex):
+            raise MeshError("bad point header or polygon-node vertex")
+        flat = [0.0] * (3 * npts)
+        for i in range(3 * npts):
+            flat[i], p = cdouble(d, p)
+        if not all(math.isfinite(value) for value in flat):
+            raise MeshError("non-finite point coordinate")
+        points = [tuple(flat[i:i + 3]) for i in range(0, len(flat), 3)]
+
+        _point_metadata, p = _legacy_nums(d, p, bmsh_end, 12)
+        (nedges1, edge_capacity, _edge_stride), p = _legacy_nums(d, p, bmsh_end, 3)
+        expected_edges1 = max((abs(edge) for edge in node_edge), default=0) + 1
+        if nedges1 != expected_edges1 or edge_capacity < nedges1:
+            raise MeshError("bad edge header")
+        edges = [None] * nedges1
+        for i in range(nedges1):
+            values, p = _legacy_nums(d, p, bmsh_end, 4)
+            edges[i] = values
+
+        (npolys, polygon_capacity, _polygon_stride), p = _legacy_nums(d, p, bmsh_end, 3)
+        if npolys < 1 or polygon_capacity < npolys or npolys > nnodes // 3:
+            raise MeshError("bad polygon header")
+        node_polygons = []
+        polygons = []
+        total = 0
+        for _ in range(npolys):
+            (size, _flags1, _flags2), p = _legacy_nums(d, p, bmsh_end, 3)
+            if size < 3 or total + size > nnodes:
+                raise MeshError("bad polygon size")
+            node_polygon, p = _legacy_nums(d, p, bmsh_end, size)
+            if any(node < 0 or node >= nnodes for node in node_polygon):
+                raise MeshError("polygon-node index out of range")
+            node_polygons.append(node_polygon)
+            polygons.append([node_vertex[node] for node in node_polygon])
+            total += size
+    except (Lost, IndexError, struct.error) as error:
+        raise MeshError("truncated BMSH geometry: %s" % error)
+
+    used_nodes = [node for polygon in node_polygons for node in polygon]
+    if total != nnodes or set(used_nodes) != set(range(nnodes)):
+        raise MeshError("polygons do not use every polygon node once")
+    used_edges = {abs(edge) for edge in node_edge}
+    if used_edges != set(range(1, nedges1)):
+        raise MeshError("polygon nodes do not use every edge")
+    for polygon, node_polygon in zip(polygons, node_polygons):
+        for i, node in enumerate(node_polygon):
+            edge_id = node_edge[node]
+            edge = edges[abs(edge_id)]
+            current, following = (edge[0], edge[1]) if edge_id > 0 else (edge[1], edge[0])
+            if current != polygon[i] or following != polygon[(i + 1) % len(polygon)]:
+                raise MeshError("polygon-node edge cycle does not close")
+    return Mesh(points, polygons, (npts, nedges1, npolys, nnodes), True,
+                nodes=node_polygons, layout="BMSH")
 
 
 # ---------------------------------------------------------------- XSI 3.x layout ----------------------
@@ -470,5 +598,3 @@ def _polygon_sizes(edge_polys, npolys, nnodes):
     if sum(sizes) != nnodes or min(sizes, default=3) < 3:
         return None
     return sizes
-
-

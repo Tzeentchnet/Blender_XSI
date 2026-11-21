@@ -8,6 +8,9 @@ purpose (tools/sicapture/softimage/gen_scn_corpus.py) by comparing them with Sof
 """
 from pathlib import Path
 
+import numpy as np
+
+from .. import convert
 from . import cfb, records
 
 # Class kinds, keyed by the GUID of the class's root parameter definition (Obj.pbase).
@@ -362,7 +365,7 @@ class Scene:
             name = obj.params.get(3)
             if not isinstance(name, str) or not name:
                 continue
-            state = self._legacy_local_state(st, obj)
+            state = self._legacy_global_state(st, obj)
             if state is not None:
                 wrappers.append(obj)
                 states[obj.handle] = state
@@ -375,12 +378,53 @@ class Scene:
             self.roots.append(model)
             self._models_by_storage[storage] = model
 
+        from . import mesh
+        legacy_meshes = []
+        global_matrices = {}
+        mesh_names = [
+            obj.params[3]
+            for obj in st.objects
+            if isinstance(obj.params.get(3), str)
+            and obj.params[3].casefold().endswith(("_model", "_mesh"))
+        ]
+        for index, primitive in enumerate(self._legacy_bmsh_owners(st)):
+            fallback = "%s_Mesh" % model_name if model_name else "Mesh"
+            name = mesh_names[index] if index < len(mesh_names) else fallback
+            if index and name == fallback:
+                name += str(index + 1)
+            so = SceneObject(name)
+            so.handle = primitive.handle
+            so.body = (st, primitive)
+            so.kind = "polymsh"
+            so.primitive = primitive
+            try:
+                so.mesh = mesh.read_polymsh_bmsh(st.data, primitive)
+            except mesh.MeshError as error:
+                self.warnings.append(f"{name}: legacy BMSH mesh not decoded ({error})")
+                continue
+            owner = primitive
+            while owner.parent is not None:
+                owner = owner.parent
+            state = self._legacy_global_state(st, owner)
+            if state is not None:
+                self._fill_legacy_transform(state, so.glob)
+                global_matrices[id(so)] = self._legacy_transform_matrix(so.glob)
+            so.model = model
+            if model is not None:
+                so.parent = model
+                model.children.append(so)
+            else:
+                self.roots.append(so)
+            legacy_meshes.append(so)
+            self.objects.append(so)
+
         made = {}
         for obj in wrappers:
             so = SceneObject(obj.params[3])
             so.handle = obj.handle
             so.body = (st, obj)
-            self._fill_legacy_transform(states[obj.handle], so.local)
+            self._fill_legacy_transform(states[obj.handle], so.glob)
+            global_matrices[id(so)] = self._legacy_transform_matrix(so.glob)
             self._fill_legacy_kind(st, obj, so)
             made[obj.handle] = so
             self.objects.append(so)
@@ -401,7 +445,22 @@ class Scene:
             else:
                 self.roots.append(so)
 
-        if wrappers:
+        for so in (*legacy_meshes, *made.values()):
+            matrix = global_matrices.get(id(so))
+            if matrix is None:
+                continue
+            parent_matrix = global_matrices.get(id(so.parent))
+            if parent_matrix is not None:
+                if abs(np.linalg.det(parent_matrix[:3, :3])) < 1e-12:
+                    self.warnings.append(
+                        f"{so.name}: parent has a singular legacy global transform; "
+                        "the child transform could not be made parent-relative"
+                    )
+                else:
+                    matrix = np.linalg.solve(parent_matrix, matrix)
+            self._fill_legacy_matrix(matrix, so.local)
+
+        if wrappers or legacy_meshes:
             self.warnings.append(
                 f"{Path(self.path).name}: imported a legacy native object stream; "
                 "unsupported object types are represented as empties"
@@ -412,8 +471,30 @@ class Scene:
                 "the legacy native object stream"
             )
 
+    @staticmethod
+    def _legacy_bmsh_owners(st):
+        positions = []
+        p = st.data.find(b"HSMB0010")
+        while p >= 0:
+            positions.append(p)
+            p = st.data.find(b"HSMB0010", p + 1)
+        owners = []
+        seen = set()
+        for position in positions:
+            containing = [
+                obj for obj in st.objects
+                if obj.body <= position and position + 12 <= obj.end
+            ]
+            if not containing:
+                continue
+            owner = min(containing, key=lambda obj: obj.end - obj.start)
+            if owner.handle not in seen:
+                seen.add(owner.handle)
+                owners.append(owner)
+        return owners
+
     @classmethod
-    def _legacy_local_state(cls, st, root):
+    def _legacy_global_state(cls, st, root):
         for obj in cls._legacy_graph(st, root):
             values = list(obj.params.values())
             if (
@@ -449,6 +530,23 @@ class Scene:
         transform.rot = [float(value) for value in values[3:6]]
         transform.quat = [float(value) for value in values[6:10]]
         transform.scl = [float(value) for value in values[10:13]]
+
+    @staticmethod
+    def _legacy_transform_matrix(transform):
+        return convert.transform_matrix(
+            transform.pos,
+            transform.rot,
+            transform.scl,
+            quaternion=transform.quat,
+        )
+
+    @staticmethod
+    def _fill_legacy_matrix(matrix, transform):
+        locations, quaternions, scales = convert.decompose(matrix[None])
+        transform.pos = locations[0].tolist()
+        transform.rot = [0.0, 0.0, 0.0]
+        transform.quat = quaternions[0].tolist()
+        transform.scl = scales[0].tolist()
 
     def _fill_legacy_kind(self, st, root, so):
         candidates = []

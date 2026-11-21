@@ -31,7 +31,7 @@ CLS_POINT_CLUSTER = "e4dd8e40-1e1c-11d0-aa2e-00a0243e34c4"
 
 def bind_matrix(d: bytes, obj) -> np.ndarray | None:
     """The 4x4 bind matrix (column-vector convention) of a 12f18b50 object, or None."""
-    for start in range(obj.body, min(obj.end, obj.body + 64)):
+    for start in range(obj.body, min(obj.end, obj.body + 128)):
         try:
             q = start
             values = []
@@ -100,6 +100,123 @@ def _cnum_encodings(v: int) -> list[bytes]:
     return out
 
 
+def _named_owner(obj):
+    while obj is not None:
+        name = obj.params.get(3)
+        if isinstance(name, str) and name:
+            return obj
+        obj = obj.parent
+    return None
+
+
+def _bmsh_bind_matrices(st, primitive, deformer_count):
+    """The target bind matrix and ordered deformer matrices of an early envelope operator."""
+    for op in st.objects:
+        if not any(handle == primitive.handle for handle, _cls, _pos in op.refs):
+            continue
+        matrices = []
+        for handle, _cls, _pos in op.refs:
+            ref = st.by_handle.get(handle)
+            if ref is None:
+                continue
+            matrix = bind_matrix(st.data, ref)
+            if matrix is not None:
+                matrices.append((ref, matrix))
+        target_index = next(
+            (
+                index for index, (obj, _matrix) in enumerate(matrices)
+                if obj.parent is primitive.parent
+            ),
+            None,
+        )
+        if target_index is None:
+            continue
+        deformers = matrices[target_index + 1:target_index + 1 + deformer_count]
+        if len(deformers) == deformer_count:
+            return matrices[target_index][1], [matrix for _obj, matrix in deformers]
+    return None, []
+
+
+def _attach_bmsh(sc) -> None:
+    from .materials import cluster_elements
+
+    for target in sc.objects:
+        if target.kind != "polymsh" or target.mesh is None or target.mesh.layout != "BMSH":
+            continue
+        body = getattr(target, "body", None)
+        if body is None:
+            continue
+        st = body[0]
+        group = next(
+            (
+                obj for obj in st.objects
+                if isinstance(obj.params.get(3), str)
+                and obj.params[3].casefold() == "for_envelope"
+            ),
+            None,
+        )
+        if group is None:
+            continue
+        deformers = []
+        for handle, _cls, _pos in group.refs:
+            obj = st.by_handle.get(handle)
+            owner = _named_owner(obj) if obj is not None else None
+            if owner is not None:
+                deformers.append((owner.params[3], owner))
+        clusters = {}
+        prefix = "envelopselcls"
+        for obj in st.objects:
+            name = obj.params.get(3)
+            if not isinstance(name, str) or not name.casefold().startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if suffix and not suffix.isdigit():
+                continue
+            index = int(suffix) if suffix else 0
+            elements = cluster_elements(st, obj)
+            if elements:
+                clusters[index] = elements
+        if not deformers or set(clusters) != set(range(len(deformers))):
+            continue
+        mesh_bind, deformer_binds = _bmsh_bind_matrices(st, target.primitive, len(deformers))
+        if mesh_bind is not None:
+            target.mesh_bind_matrix = mesh_bind
+        if len(deformer_binds) == len(deformers):
+            scene_objects = {
+                (id(so.body[0]), so.handle): so
+                for so in sc.objects
+                if getattr(so, "body", None) is not None
+            }
+            for (_name, owner), matrix in zip(deformers, deformer_binds):
+                deformer = scene_objects.get((id(st), owner.handle))
+                if deformer is not None and deformer.bind_matrix is None:
+                    deformer.bind_matrix = matrix
+        else:
+            sc.warnings.append(
+                f"{target.name}: legacy envelope bind matrices could not be decoded"
+            )
+        used = set()
+        envelope = {}
+        valid = True
+        for index, (name, _owner) in enumerate(deformers):
+            vertices = clusters[index]
+            current = set(vertices)
+            if (
+                len(current) != len(vertices)
+                or used.intersection(current)
+                or any(vertex < 0 or vertex >= len(target.mesh.points) for vertex in vertices)
+            ):
+                valid = False
+                break
+            used.update(current)
+            envelope[name] = (
+                np.asarray(vertices, dtype=np.int64),
+                np.ones(len(vertices), dtype=np.float32),
+            )
+        if valid:
+            target.envelope = envelope
+
+
 def attach(sc) -> None:
     """Fill `envelope` ({deformer name: (vertices, weights 0..1)}) on enveloped polymsh objects and
     `bind_matrix` (Softimage global 4x4) on their deformers."""
@@ -150,3 +267,4 @@ def attach(sc) -> None:
                 if bind is not None and getattr(deformer, "bind_matrix", None) is None:
                     deformer.bind_matrix = bind
             target.envelope = envelope
+    _attach_bmsh(sc)

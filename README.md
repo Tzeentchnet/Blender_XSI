@@ -3,12 +3,23 @@
 This Blender extension imports Autodesk Softimage files without requiring Softimage:
 
 - ASCII dotXSI (`.xsi`), versions 3.0 – 6.0
-- Native Softimage scenes (`.scn`), including scenes saved by XSI 2.x – 4.x
-- Native Softimage models (`.emdl`)
+- Native Softimage scenes and models (`.scn`, `.emdl`), including early XSI 1.x BMSH models and
+  XSI 2.x – 4.x Half-Life 2 source files
 
 Geometry, materials and textures, skeletons (as armatures), skinning, shape animation and transform
 animation are converted. How each piece is read and converted, and what is still unknown, is documented
 in [`docs/`](docs/README.md).
+
+## Example import
+
+This legacy `Dog.emdl` demonstrates an early BMSH mesh with embedded shader colours, polygon material
+clusters, a skeleton, and rigid envelope assignments imported into Blender 5.2.
+
+| Imported model | Posed after import |
+| :---: | :---: |
+| ![Legacy Softimage Dog model imported into Blender](docs/images/legacy-dog-import.png) | ![Legacy Softimage Dog model posed with its imported rig](docs/images/legacy-dog-posed.png) |
+
+Model source: [SOFTIMAGE&#124; XSI Tools, Scripts, Plugins, Shaders, Models and much much more.](https://www.edharriss.com/xsi/models/models.htm)
 
 ## Install
 
@@ -19,7 +30,7 @@ blender --command extension build --source-dir src/io_scene_softimage --output-d
 ```
 
 In Blender 5.2, open **Edit > Preferences > Extensions**, choose **Install from Disk**, and select
-`dist/io_scene_softimage-0.2.1.zip`. Import from **File > Import > Softimage (.xsi, .scn, .emdl)**, or
+`dist/io_scene_softimage-0.3.0.zip`. Import from **File > Import > Softimage (.xsi, .scn, .emdl)**, or
 drag files into the 3D viewport. Several files can be imported at once.
 
 ## Import options
@@ -57,12 +68,12 @@ polygon-to-material assignments.
 
 ### Native `.scn` / `.emdl`
 
-| Data | XSI 2.x – 4.x | Softimage 6.x – 2015 |
+| Data | XSI 1.x – 4.x | Softimage 6.x – 2015 |
 | --- | --- | --- |
 | Hierarchy, names, transforms, visibility | Supported | Supported |
-| Frozen polygon meshes | Supported (sequential 3.x layout) | Supported |
+| Frozen polygon meshes | Supported (BMSH and sequential 3.x layouts) | Supported |
 | UV maps | Supported (sample-cluster ordering, partial projections merged) | Supported |
-| Materials and textures | Phong / Constant / Material__N shaders, image clips | Render trees (Phong, Blinn, Lambert, Arnold, ...) |
+| Materials and textures | Embedded Lambert / Phong / Cook-Torrance / Constant shaders; 3.x image clips | Render trees (Phong, Blinn, Lambert, Arnold, ...) |
 | Envelopes (skinning) | Supported, bind matrices used as rest pose | Not yet decoded |
 | Transform F-curves | Supported (frame rate detected, 29.97 for HL2) | Not tested |
 | Live primitives | Rebuilt from generator parameters (stacked operators ignored) | Same |

@@ -218,6 +218,112 @@ def st_name_id(st):
     return cached if cached >= 0 else None
 
 
+_BMSH_SHADERS = {"lambert", "phong", "cooktorrance", "constant"}
+
+
+def _bmsh_descendants(root):
+    queue = list(root.children)
+    while queue:
+        obj = queue.pop(0)
+        yield obj
+        queue.extend(obj.children)
+
+
+def _bmsh_name(st, obj):
+    name = obj.params.get(3)
+    if isinstance(name, str) and name:
+        return name
+    strings = _strings(st.data, obj.body, min(obj.end, obj.body + 256))
+    return strings[0] if strings else None
+
+
+def _bmsh_shader(st, root):
+    for obj in _bmsh_descendants(root):
+        name = _bmsh_name(st, obj)
+        if isinstance(name, str) and name.casefold() in _BMSH_SHADERS:
+            return obj
+    return None
+
+
+def _bmsh_material(key, name, shader):
+    shader_name = shader.params.get(3, "").casefold()
+    result = LegacyMaterial(key=key, name=name, shader=shader_name)
+    colours = []
+    for child in shader.children:
+        values = list(child.params.values())
+        if len(values) == 4 and all(type(value) in (int, float) for value in values):
+            colours.append(tuple(float(value) for value in values))
+    if colours:
+        result.colours["ambient"] = colours[0]
+    if shader_name == "cooktorrance":
+        if len(colours) > 1:
+            result.colours["specular"] = colours[1]
+        if len(colours) > 2:
+            result.colours["diffuse"] = colours[2]
+    else:
+        if len(colours) > 1:
+            result.colours["diffuse"] = colours[1]
+        elif colours:
+            result.colours["diffuse"] = colours[0]
+        if len(colours) > 2:
+            result.colours["specular"] = colours[2]
+    return result
+
+
+def _attach_bmsh(sc, reader):
+    from .materials import cluster_elements
+
+    found = False
+    storages = {id(st): storage for storage, st in sc.models.items()}
+    for so in sc.objects:
+        if so.kind != "polymsh" or so.mesh is None or so.mesh.layout != "BMSH":
+            continue
+        body = getattr(so, "body", None)
+        if body is None:
+            continue
+        st = body[0]
+        storage = storages.get(id(st), "")
+        clusters = []
+        used_shaders = set()
+        for obj in st.objects:
+            explicit_name = obj.params.get(3)
+            name = explicit_name if isinstance(explicit_name, str) and explicit_name else _bmsh_name(st, obj)
+            if not isinstance(explicit_name, str) and (
+                not isinstance(name, str) or not name.casefold().endswith("_mat")
+            ):
+                continue
+            elements = cluster_elements(st, obj)
+            if not elements or any(index < 0 or index >= len(so.mesh.polygons) for index in elements):
+                continue
+            shader = _bmsh_shader(st, obj)
+            if shader is None:
+                continue
+            key = f"{storage.rsplit('/', 1)[-1]}:{obj.handle}"
+            reader.materials[key] = _bmsh_material(key, name, shader)
+            clusters.append(ClusterMaterial(name, elements, key))
+            used_shaders.add(shader.handle)
+        base_shader = next(
+            (
+                obj for obj in st.objects
+                if obj.handle not in used_shaders
+                and isinstance(obj.params.get(3), str)
+                and obj.params[3].casefold() in _BMSH_SHADERS
+            ),
+            None,
+        )
+        if base_shader is not None:
+            key = f"{storage.rsplit('/', 1)[-1]}:base:{base_shader.handle}"
+            reader.materials[key] = _bmsh_material(
+                key, f"{so.name}_Material", base_shader
+            )
+            so.material = key
+        if clusters:
+            so.cluster_materials = clusters
+        if base_shader is not None or clusters:
+            found = True
+    return found
+
+
 def attach(sc) -> bool:
     """Fill `material` / `cluster_materials` of 3.x polygon meshes. Returns False when the scene does not
     use the 3.x material layout (nothing found)."""
@@ -259,6 +365,8 @@ def attach(sc) -> bool:
             main = max(clusters, key=lambda c: len(c.polygons))
             so.material = main.material
             so.cluster_materials = [c for c in clusters if c is not main]
+    if not found:
+        found = _attach_bmsh(sc, reader)
     if found:
         sc.legacy_materials = reader.materials
     return found

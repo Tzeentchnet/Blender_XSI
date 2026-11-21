@@ -2,8 +2,9 @@
 
 Native scenes and models are Microsoft Compound File Binary (OLE2 "structured storage") containers.
 The vendored reader (`native_scn/`, originally from Silica, reverse engineered on Softimage 6.x - 2015
-scenes) was extended for scenes saved by **XSI 2.x - 4.x**, the versions used for the Half-Life 2 sources
-(`TLShell/VersionInfo` lists saves such as `3.01.2002.1127`, `3.5.2003.0520`, `3.51.2003.1208`).
+scenes) was extended for scenes and models saved by **XSI 1.x - 4.x**, including the versions used for
+the Half-Life 2 sources (`TLShell/VersionInfo` lists saves such as `3.01.2002.1127`,
+`3.5.2003.0520`, `3.51.2003.1208`).
 
 Notation: `cnum` is the compact unsigned integer (high nibble F/E/D/C = 4/12/20/28 value bits), `cdouble`
 the compact double (`ff` 0, `fe` 1, `fd` -1, `fc` f64, `fb` f32, `fa` i32, `f9` i16, `f8` i8). GUIDs are
@@ -36,6 +37,31 @@ scanned even when no parameter block is found.
 
 Effect on a 1-in-20 sample of the corpus: objects of unknown kind went from 29,133 to 90; meshes found
 from 10 to 3,172.
+
+## Polygon meshes (XSI 1.x BMSH layout)
+
+Early `.emdl` files can store frozen geometry in nested `BMSH0010` / `CMSH2010` chunks. The
+`MSHI2010` table is followed by polygon-node, point, edge and polygon tables:
+
+```
+<nnodes> <capacity> <stride>
+nnodes x (<vertex> <signed oriented edge> <reverse node>)
+<npts> <capacity> <stride>
+3 * npts cdouble
+12 compact point-metadata values
+<nedges + 1> <capacity> <stride>
+(nedges + 1) x (4 compact values)                 entry zero is a sentinel
+<npolys> <capacity> <stride>
+npolys x (<size> <flag> <flag> <size node ids>)
+```
+
+These streams add signed compact integers: high nibbles A/9/8/7 are sign-extended 4/12/20/28-bit
+values. The oriented edge ids and reverse-node permutation make the topology self-validating.
+
+The mesh object itself can have a target bind matrix before the deformer bind matrices in its envelope
+operator. This matrix is required: BMSH points are stored in a small object-local space, while the
+skeleton uses the model's full bind space. Applying only the saved kinematic state leaves the mesh at
+the wrong scale and orientation.
 
 ## Polygon meshes (XSI 3.x layout)
 
@@ -107,6 +133,10 @@ polymsh -> cluster container (60f7ada0) -> polygon cluster (600e50f1, e.g. "tex_
 * Polygon clusters list their polygon indices with the same element-list block as sample clusters.
   The largest cluster's material is used as the object material.
 
+XSI 1.x BMSH models can instead embed named Lambert, Phong, Cook-Torrance and Constant shaders below
+their material and polygon-cluster objects. Their diffuse colours are imported directly; external
+images are not inferred when the package contains no image sources.
+
 ## Visibility
 
 The visibility property (class `11ebe301-a20c-11d0-8478-00a024c7919c`) holds boolean parameters;
@@ -164,3 +194,9 @@ to its last byte, and every point's weights sum to 100.
 Bind matrices become the armature rest pose. Bind globals are derived top-down: nodes without a bind
 matrix (chain roots, effectors, helpers between deformers) keep their saved local transform relative to
 their parent's bind global.
+
+In early BMSH envelopes, `For_envelope` lists deformers in the same order as `EnvelopSelCls`,
+`EnvelopSelCls1`, ... and the operator's bind matrices. Populated selection clusters are disjoint and
+therefore represent explicit rigid 100% assignments. The first matrix is the target mesh bind matrix;
+the following matrices establish the deformer rest transforms. Legacy kinematic records store saved
+global transforms, so the importer derives parent-relative locals before building armatures.
