@@ -12,14 +12,14 @@ in [`docs/`](docs/README.md).
 
 ## Install
 
-Build an extension archive:
+Build a release archive with Blender's extension command:
 
 ```sh
-python3 tools/build_extension.py
+blender --command extension build --source-dir src/io_scene_softimage --output-dir dist
 ```
 
 In Blender 5.2, open **Edit > Preferences > Extensions**, choose **Install from Disk**, and select
-`dist/io_scene_softimage-0.2.0.zip`. Import from **File > Import > Softimage (.xsi, .scn, .emdl)**, or
+`dist/io_scene_softimage-0.2.1.zip`. Import from **File > Import > Softimage (.xsi, .scn, .emdl)**, or
 drag files into the 3D viewport. Several files can be imported at once.
 
 ## Import options
