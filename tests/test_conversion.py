@@ -115,6 +115,18 @@ class ImageResolverTests(unittest.TestCase):
             self.assertEqual(resolver.resolve("U:\\elsewhere\\leg.tga").name, "leg.png")
             self.assertIsNone(images.ImageResolver(scene_dir / "f.xsi", search=False).resolve("U:\\x\\y.tga"))
 
+    def test_reroots_to_nearby_source_asset_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "Alyx_XSI"
+            source = project / "Source"
+            source.mkdir(parents=True)
+            (source / "alyxboot.bmp").write_bytes(b"x")
+            scene_dir = project / "dotXSI" / "MaxAnims"
+            scene_dir.mkdir(parents=True)
+            resolver = images.ImageResolver(scene_dir / "Walk.xsi", search=False)
+            found = resolver.resolve("U:\\hl2\\hl2\\materialsrc\\Models\\Alyx\\alyxboot.tga")
+            self.assertEqual(found, (source / "alyxboot.bmp").resolve())
+
     def test_split_stored_path(self):
         self.assertEqual(images.split_stored_path("U:\\a\\b.tga"), ["a", "b.tga"])
         self.assertEqual(images.split_stored_path("[Project Path]\\Pictures\\c.pic"), ["Pictures", "c.pic"])

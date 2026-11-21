@@ -50,6 +50,11 @@ drag files into the 3D viewport. Several files can be imported at once.
 | Cameras, lights, clusters, custom parameter sets | Supported |
 | Binary dotXSI | Not supported (re-export as ASCII) |
 
+The importer reports animated Biped exports that contain meshes but no `SI_Envelope` or
+`SI_ShapeAnimation`: those files do not contain enough data to make geometry follow the armature.
+Undefined material references are also reported because nearby image files cannot reconstruct missing
+polygon-to-material assignments.
+
 ### Native `.scn` / `.emdl`
 
 | Data | XSI 2.x – 4.x | Softimage 6.x – 2015 |
@@ -70,9 +75,10 @@ evaluation of the files to float precision. See [`docs/testing.md`](docs/testing
 ## Texture lookup
 
 Stored absolute paths are tried first, then every trailing part of the stored path below the scene
-folder, its Softimage project, `Pictures` and the scene's ancestor folders (so `U:\hl2\hl2\materialsrc\...`
-is found inside a copied archive), then other image extensions, then (optionally) a file-name index of the
-nearest content folder. Missing images become placeholder images that point at the stored path.
+folder, its Softimage project, nearby `Pictures` / `Source` asset folders and the scene's ancestor folders
+(so `U:\hl2\hl2\materialsrc\...` is found inside a copied archive), then other image extensions, then
+(optionally) a file-name index of the nearest content folder. Missing images become placeholder images
+that point at the stored path.
 
 ## Development
 

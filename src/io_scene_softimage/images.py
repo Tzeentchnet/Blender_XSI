@@ -7,8 +7,8 @@ tries, in order:
 
 1. the stored path itself (after `[Project Path]` substitution);
 2. "re-rooting": every trailing part of the stored path (`materialsrc/Models/Alyx/alyxboot.tga`,
-   `Models/Alyx/alyxboot.tga`, ...) below the scene folder, its Softimage project, its Pictures folder and
-   every ancestor folder of the scene;
+   `Models/Alyx/alyxboot.tga`, ...) below the scene folder, its Softimage project, nearby Pictures /
+   Source asset folders and every ancestor folder of the scene;
 3. the same with other common image extensions (a `.tga` that was converted to `.png`, ...);
 4. optionally, a basename index of image files under the nearest ancestor that looks like a content root
    (contains `materialsrc`, `Pictures`, `textures` ...), ranked by how many trailing folder names match.
@@ -52,8 +52,9 @@ class ImageResolver:
         self.project = project_folder(self.scene_path)
         directory = self.scene_path.parent
         ancestors = [directory, *directory.parents][:max_levels + 1]
-        roots: list[Path] = [directory, self.project, self.project / "Pictures", directory / "Pictures"]
-        roots.extend(ancestors[1:])
+        roots: list[Path] = [directory, self.project]
+        for ancestor in ancestors:
+            roots.extend((ancestor, ancestor / "Pictures", ancestor / "Source"))
         self.roots = list(dict.fromkeys(roots))
         self._cache: dict[str, Path | None] = {}
         self._index: dict[str, list[Path]] | None = None

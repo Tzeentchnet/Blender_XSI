@@ -129,6 +129,11 @@ shape a weight curve is written that is 1 where the curve equals the shape numbe
 at the neighbouring shapes, which reproduces linear blending between consecutive caches. Without the
 curve, shape `k` is placed at scene start + k.
 
+Some MAX2XSI animation exports contain an animated Biped and a static copy of its mesh but neither
+`SI_Envelope` nor `SI_ShapeAnimation`. They also commonly reference 3ds Max material names without
+exporting matching `SI_Material` definitions. The importer reports both conditions: skin weights and
+polygon-to-texture assignments cannot be inferred safely from geometry or from nearby image files.
+
 ### Envelopes
 
 `SI_Envelope { <mesh>, <deformer>, <count>, (vertex, weight) x count }`. Weights are percentages in

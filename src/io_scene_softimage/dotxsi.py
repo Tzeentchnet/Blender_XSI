@@ -99,6 +99,7 @@ _CHANNEL_ALIASES = {
     "SCL": "scale", "SCALE": "scale", "SCALING": "scale", "SCA": "scale",
 }
 _VISIBILITY = {"NODEVIS", "VISIBILITY", "VIEWVIS", "RENDVIS", "VIS"}
+_BIPED_NAME = re.compile(r"(?i)^(bip\d*|valvebiped)([ _.\-]|$)")
 
 
 def resolve_channel(channel: str, component: int | None = None) -> tuple[str | None, int]:
@@ -197,6 +198,7 @@ class _Converter:
         self._assign_curves()
         self._assign_shape_animation()
         self._assign_envelopes()
+        self._warn_incomplete_export()
         scene.actions = [action for action in self.actions.values() if action.curves]
         for template, count in sorted(self.unknown.items()):
             scene.warnings.append(f"Skipped {count} unsupported {template} template(s).")
@@ -384,7 +386,9 @@ class _Converter:
             elif template == "SI_Visibility" and child.tokens:
                 obj.visible = bool(child.integer(0, "visibility"))
             elif template == "SI_GlobalMaterial" and child.tokens:
-                obj.material = str(child.tokens[0])
+                material_name = str(child.tokens[0])
+                obj.material = material_name
+                obj.properties["softimage_global_material"] = material_name
                 propagation = str(child.tokens[1]).upper() if len(child.tokens) > 1 else "NODE"
                 obj.properties["softimage_material_propagation"] = propagation
                 if propagation == "INHERITED":
@@ -869,6 +873,42 @@ class _Converter:
         for obj in objects:
             if obj.name.casefold() in deformers and not obj.bone_role:
                 obj.bone_role = "DEFORMER"
+
+    def _warn_incomplete_export(self) -> None:
+        """Report source data that cannot be reconstructed by Blender-side fallbacks."""
+        objects = list(self.scene.walk())
+        meshes = [obj.mesh for obj in objects if obj.mesh is not None and len(obj.mesh.points)]
+        animated_biped = any(obj.animation and _BIPED_NAME.match(obj.name) for obj in objects)
+        has_mesh_deformation = any(mesh.envelope_weights or mesh.shape_keys for mesh in meshes)
+        if meshes and animated_biped and not has_mesh_deformation:
+            self.scene.warnings.append(
+                "This file animates a Biped hierarchy but contains no SI_Envelope or SI_ShapeAnimation "
+                "data; its meshes cannot follow the armature. Re-export skin deformation or use an "
+                "enveloped source scene/model."
+            )
+
+        references = {
+            name
+            for obj in objects
+            for name in (
+                ([obj.material] if obj.material else [])
+                + (obj.mesh.material_names if obj.mesh is not None else [])
+            )
+            if name
+        }
+        definitions = tuple(self.scene.materials)
+        missing = sorted(
+            (name for name in references if not any(same_name(name, defined) for defined in definitions)),
+            key=str.casefold,
+        )
+        if missing:
+            shown = ", ".join(repr(name) for name in missing[:8])
+            if len(missing) > 8:
+                shown += f", and {len(missing) - 8} more"
+            self.scene.warnings.append(
+                f"{len(missing)} referenced material(s) have no definition in this file: {shown}. "
+                "Image search cannot recover textures without material/image references."
+            )
 
 
 # ---------------------------------------------------------------------- mesh assembly

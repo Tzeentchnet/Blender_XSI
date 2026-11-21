@@ -99,6 +99,33 @@ class DotXSITests(unittest.TestCase):
         self.assertEqual(mesh.face_materials, ["Material", "Material"])
         self.assertEqual(len(mesh.corner_normals), 6)
 
+    def test_warns_when_animated_biped_export_omits_skin_and_material_definitions(self):
+        scene = dotxsi.loads(
+            "xsi 0300txt 0032\n"
+            "SI_MaterialLibrary { 1;"
+            " SI_Material Scene_Root { .7;.7;.7;1; 50; 1;1;1; 0;0;0; 2; .3;.3;.3; }"
+            "}\n"
+            "SI_Model MDL-Root {\n"
+            " SI_Model MDL-Bip01 {\n"
+            "  SI_FCurve { \"Bip01\"; \"Bip01.kine.local.rotx\"; \"LINEAR\"; 1; 1; 2;"
+            "   0;0; 1;10; }\n"
+            " }\n"
+            " SI_Model MDL-Body {\n"
+            "  SI_GlobalMaterial { \"MissingSkin\"; \"NODE\"; }\n"
+            "  SI_Mesh MSH-Body {\n"
+            "   SI_Shape SHP-Body { 1; \"ORDERED\"; 3; \"POSITION\";"
+            "    0;0;0; 1;0;0; 0;1;0; }\n"
+            "   SI_TriangleList Body { 1; \"\"; \"Scene_Root\"; 0;1;2; }\n"
+            "  }\n"
+            " }\n"
+            "}\n"
+        )
+        warnings = "\n".join(scene.warnings)
+        self.assertIn("no SI_Envelope or SI_ShapeAnimation", warnings)
+        self.assertIn("'MissingSkin'", warnings)
+        body = next(obj for obj in scene.walk() if obj.name == "Body")
+        self.assertEqual(body.properties["softimage_global_material"], "MissingSkin")
+
     def test_reads_crosswalk_transform_and_camera_templates(self):
         transform_values = [
             1, 2, 3,
